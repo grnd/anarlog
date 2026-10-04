@@ -5729,6 +5729,10 @@ msgstr "Sparkle"
 msgid "Speak into the focused text field in your apps. Your transcript appears when you finish."
 msgstr "Speak into the focused text field in your apps. Your transcript appears when you finish."
 
+#: src/settings/general/audio-settings.tsx
+msgid "Split stereo microphone into two speakers"
+msgstr "Split stereo microphone into two speakers"
+
 #: src/settings/general/storage/legacy-cleanup.tsx
 msgid "SQLite migration verification is incomplete"
 msgstr "SQLite migration verification is incomplete"
@@ -6202,6 +6206,10 @@ msgstr "Today"
 #: src/sidebar/timeline/utils/index.ts
 msgid "Tomorrow"
 msgstr "Tomorrow"
+
+#: src/settings/general/audio-settings.tsx
+msgid "Transcribe the left channel as one speaker and the right channel as another, for a two-transmitter wireless mic in stereo mode. System audio is not recorded while this is on."
+msgstr "Transcribe the left channel as one speaker and the right channel as another, for a two-transmitter wireless mic in stereo mode. System audio is not recorded while this is on."
 
 #: src/chat/components/input/index.tsx
 msgid "Transcribing voice input"

@@ -409,6 +409,25 @@ describe("useRunBatch", () => {
     },
   );
 
+  test("sends split_stereo_mic only when the caller opts in", async () => {
+    useConfigValueMock.mockImplementation((key) => {
+      if (key === "microphone_split_stereo") return true;
+      return key === "ai_language" ? "en" : [];
+    });
+    const { result } = renderHook(() => useRunBatch("session-1"));
+
+    await result.current("/tmp/upload.wav");
+    await result.current("/tmp/capture.wav", { splitStereoMic: true });
+
+    expect(startTranscriptionMock).toHaveBeenCalledTimes(2);
+    expect(startTranscriptionMock.mock.calls[0]?.[0]).toMatchObject({
+      split_stereo_mic: false,
+    });
+    expect(startTranscriptionMock.mock.calls[1]?.[0]).toMatchObject({
+      split_stereo_mic: true,
+    });
+  });
+
   test("cancels the active provider and never retries authentication after abort", async () => {
     const abort = new AbortController();
     useSTTConnectionMock.mockReturnValue({

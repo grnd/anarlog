@@ -235,6 +235,8 @@ export function useCaptureLifecycle(sessionId: string) {
       recoveredMarker?: CaptureLifecycleMarker,
       startedAutomatically = false,
       pendingMarker?: CaptureLifecycleMarker,
+      // The split mode sent to the native capture this lifecycle starts.
+      startedSplitStereoMic = false,
     ) => {
       const inheritedCaptures: InheritedCapture[] =
         recoveredMarker?.inheritedCaptures ??
@@ -254,6 +256,9 @@ export function useCaptureLifecycle(sessionId: string) {
                   ? { provider: pendingMarker.provider }
                   : {}),
                 ...(pendingMarker.model ? { model: pendingMarker.model } : {}),
+                ...(pendingMarker.splitStereoMic
+                  ? { splitStereoMic: true }
+                  : {}),
               },
             ]
           : []);
@@ -293,6 +298,23 @@ export function useCaptureLifecycle(sessionId: string) {
       const ownerUserId =
         recoveredMarker?.ownerUserId ?? session?.user_id ?? "";
       const provider = recoveredMarker?.provider ?? conn?.provider;
+      const splitStereoMic = recoveredMarker
+        ? recoveredMarker.splitStereoMic === true
+        : startedSplitStereoMic;
+      // Whether the session already had audio when this capture started, so
+      // its split mode is unknown. Only split captures ask.
+      const untrackedPriorAudioPromise: Promise<boolean> = !splitStereoMic
+        ? Promise.resolve(true)
+        : recoveredMarker
+          ? Promise.resolve(recoveredMarker.untrackedPriorAudio !== false)
+          : (async () => {
+              try {
+                const result = await fsSyncCommands.audioExist(sessionId);
+                return result.status !== "ok" || result.data;
+              } catch {
+                return true;
+              }
+            })();
       const model = recoveredMarker?.model ?? conn?.model;
       const retainAudio =
         recoveredMarker?.retainAudio ??
@@ -533,6 +555,9 @@ export function useCaptureLifecycle(sessionId: string) {
             await runBatchRef.current(chunk.path, {
               signal,
               deferAudioFinalization: true,
+              ...((inherited ? inherited.splitStereoMic : splitStereoMic)
+                ? { splitStereoMic: true }
+                : {}),
               notifyOnCompletion: false,
               recovery: {
                 persist: async (words, hints) => {
@@ -746,6 +771,12 @@ export function useCaptureLifecycle(sessionId: string) {
         memo: memoMd,
         ...(provider ? { provider } : {}),
         ...(model ? { model } : {}),
+        ...(splitStereoMic
+          ? {
+              splitStereoMic: true,
+              untrackedPriorAudio: await untrackedPriorAudioPromise,
+            }
+          : {}),
         ...(pendingSummaryMode ? { summaryMode: pendingSummaryMode } : {}),
         ...(refreshSummaryAfterRepair
           ? { refreshSummaryAfterRepair: true }
@@ -956,8 +987,20 @@ export function useCaptureLifecycle(sessionId: string) {
               finalAudioDurationMs + 1_000 >= existingAudioDurationMs
                 ? Math.min(existingAudioDurationMs, finalAudioDurationMs)
                 : 0;
+            const currentCaptureOnly =
+              preserveExistingTranscript || transcriptCreated;
+            // A whole-session run also covers earlier session audio; filter
+            // bleed only for a fresh session, where this split capture is all
+            // of it. Inherited captures' records can be stale (audio may have
+            // been imported since), so any of them rules filtering out.
+            const filterBleed =
+              splitStereoMic &&
+              (currentCaptureOnly ||
+                (inheritedCaptures.length === 0 &&
+                  !(await untrackedPriorAudioPromise)));
             await runBatchRef.current(details.audioPath!, {
               deferAudioFinalization: true,
+              ...(filterBleed ? { splitStereoMic: true } : {}),
               notifyOnCompletion: !details.liveTranscriptionActive,
               ...(useLocalBatchForSpeakerDiarization
                 ? {
@@ -967,17 +1010,16 @@ export function useCaptureLifecycle(sessionId: string) {
                     apiKey: "",
                   }
                 : {}),
-              promotion:
-                preserveExistingTranscript || transcriptCreated
-                  ? {
-                      scope: "current_capture",
-                      audioOffsetMs,
-                      ...(transcriptCreated
-                        ? { replaceTranscriptId: transcriptId }
-                        : {}),
-                      startedAt,
-                    }
-                  : { scope: "whole_session" },
+              promotion: currentCaptureOnly
+                ? {
+                    scope: "current_capture",
+                    audioOffsetMs,
+                    ...(transcriptCreated
+                      ? { replaceTranscriptId: transcriptId }
+                      : {}),
+                    startedAt,
+                  }
+                : { scope: "whole_session" },
             });
             batchCompleted = true;
             console.info("[listener] completed post-stop transcript repair", {

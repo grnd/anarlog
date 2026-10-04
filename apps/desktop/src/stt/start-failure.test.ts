@@ -80,6 +80,17 @@ describe("classifyStartFailure", () => {
     ).toBe("recorder");
   });
 
+  test("recognizes a mono microphone rejected by split stereo mode", () => {
+    expect(
+      classifyStartFailure({
+        stage: "capture_rejected",
+        error: "selected microphone is not stereo",
+        microphonePermission: "denied",
+      }),
+    ).toBe("mic_not_stereo");
+    expect(describeStartFailure("mic_not_stereo").action?.tab).toBe("meetings");
+  });
+
   test("offers the permissions page for a missing microphone grant", () => {
     expect(describeStartFailure("microphone_permission").action?.tab).toBe(
       "permissions",

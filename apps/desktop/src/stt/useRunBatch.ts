@@ -52,6 +52,9 @@ type RunOptions = {
     persist: (words: WordWithId[], hints: SpeakerHintWithId[]) => Promise<void>;
   };
   deferAudioFinalization?: boolean;
+  // Only for runs that finish a split-stereo capture; the bleed filter drops
+  // words from other recordings.
+  splitStereoMic?: boolean;
   handlePersist?: BatchPersistCallback;
   notifyOnCompletion?: boolean;
   resume?: { provider: BatchProvider; model: string };
@@ -548,8 +551,14 @@ export const useRunBatch = (sessionId: string) => {
               !options?.recovery &&
               !options?.deferAudioFinalization &&
               options?.promotion?.scope === "whole_session"
-                ? serializeBatchResumeContext({ promotion: "whole_session" })
+                ? serializeBatchResumeContext({
+                    promotion: "whole_session",
+                    ...(options?.splitStereoMic === true
+                      ? { splitStereoMic: true }
+                      : {}),
+                  })
                 : null,
+            split_stereo_mic: options?.splitStereoMic === true,
           };
 
           const run = async (params: TranscriptionParams) => {

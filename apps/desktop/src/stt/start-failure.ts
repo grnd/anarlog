@@ -17,6 +17,7 @@ export type StartFailureKind =
   | "already_running"
   | "storage"
   | "microphone_permission"
+  | "mic_not_stereo"
   | "recorder";
 
 const START_FAILURE_TOAST_ID = "capture-start-failed";
@@ -38,6 +39,9 @@ export function classifyStartFailure({
   }
   if (error?.includes("session storage unavailable")) {
     return "storage";
+  }
+  if (error?.includes("selected microphone is not stereo")) {
+    return "mic_not_stereo";
   }
   if (microphonePermission && microphonePermission !== "authorized") {
     return "microphone_permission";
@@ -68,6 +72,13 @@ export function describeStartFailure(kind: StartFailureKind): {
         title: "Anarlog doesn't have microphone access",
         description: "Allow microphone access for Anarlog, then try again.",
         action: { label: "Open permissions", tab: "permissions" },
+      };
+    case "mic_not_stereo":
+      return {
+        title: "Your microphone isn't stereo",
+        description:
+          "Splitting into two speakers needs a stereo input. Choose a stereo microphone or turn off the split in Audio settings.",
+        action: { label: "Audio settings", tab: "meetings" },
       };
     case "recorder":
       return {

@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { commands as fsSyncCommands } from "@anlg/plugin-fs-sync";
 import {
   commands as transcriptionCommands,
   events as transcriptionEvents,
@@ -1555,6 +1556,201 @@ describe("useStartListening", () => {
       expect(endCloudsyncActivityMock).toHaveBeenCalled();
     },
   );
+
+  test.each([
+    { name: "a fresh session", priorAudio: false, splitStereoMic: true },
+    {
+      name: "not for earlier untracked session audio",
+      priorAudio: true,
+      splitStereoMic: false,
+    },
+  ])(
+    "asks the final whole-session batch run to filter bleed for a split capture: $name",
+    async ({ priorAudio, splitStereoMic }) => {
+      vi.mocked(fsSyncCommands.audioExist).mockResolvedValueOnce({
+        status: "ok",
+        data: priorAudio,
+      });
+      useConfigValueMock.mockImplementation((key) =>
+        key === "ai_language"
+          ? "en"
+          : key === "microphone_split_stereo"
+            ? true
+            : key === "consent_auto_send_chat" || key === "capture_meeting_chat"
+              ? false
+              : [],
+      );
+      const { result } = renderHook(() => useStartListening("session-1"));
+
+      await act(async () => {
+        await result.current();
+      });
+
+      const onStopped = startMock.mock.calls[0]?.[1]?.onStopped;
+      await act(async () => {
+        await onStopped?.("session-1", {
+          durationSeconds: 42,
+          audioPath: "/tmp/session.wav",
+          requestedLiveTranscription: false,
+          liveTranscriptionActive: false,
+          needsBatchRepair: false,
+        });
+      });
+
+      expect(saveCaptureLifecycleMarkerMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          splitStereoMic: true,
+          untrackedPriorAudio: priorAudio,
+        }),
+      );
+      expect(runBatchMock).toHaveBeenCalledWith(
+        "/tmp/session.wav",
+        expect.objectContaining({ promotion: { scope: "whole_session" } }),
+      );
+      expect(runBatchMock.mock.calls[0]?.[1]?.splitStereoMic === true).toBe(
+        splitStereoMic,
+      );
+    },
+  );
+
+  test("keeps bleed filtering for a recovered split capture after the setting was turned off", async () => {
+    loadCaptureLifecycleMarkerMock.mockResolvedValue({
+      version: 1,
+      sessionId: "session-1",
+      transcriptId: "transcript-before-reload",
+      startedAt: 1_000,
+      createdAt: "2026-07-24T00:00:00.000Z",
+      audioOffsetMs: 0,
+      preserveExistingTranscript: false,
+      ownerUserId: "user-1",
+      memo: "",
+      splitStereoMic: true,
+      untrackedPriorAudio: false,
+    });
+    const { result } = renderHook(() =>
+      useResumeListeningLifecycle("session-1"),
+    );
+
+    await act(async () => {
+      await result.current({ processStopped: true });
+    });
+    const onStopped = attachLiveSessionMock.mock.calls[0]?.[1]?.onStopped;
+    await act(async () => {
+      await onStopped?.("session-1", {
+        durationSeconds: 42,
+        audioPath: "/tmp/session.wav",
+        requestedLiveTranscription: false,
+        liveTranscriptionActive: false,
+        needsBatchRepair: false,
+      });
+    });
+
+    expect(runBatchMock).toHaveBeenCalledWith(
+      "/tmp/session.wav",
+      expect.objectContaining({ splitStereoMic: true }),
+    );
+  });
+
+  test("does not filter bleed across a whole session that inherits an earlier split capture", async () => {
+    // The earlier capture's "no prior audio" record can be stale: audio may
+    // have been imported into the session since, so any inherited capture
+    // rules out whole-session filtering.
+    vi.mocked(fsSyncCommands.audioExist).mockResolvedValueOnce({
+      status: "ok",
+      data: false,
+    });
+    useConfigValueMock.mockImplementation((key) =>
+      key === "ai_language"
+        ? "en"
+        : key === "microphone_split_stereo"
+          ? true
+          : key === "consent_auto_send_chat" || key === "capture_meeting_chat"
+            ? false
+            : [],
+    );
+    loadCaptureLifecycleMarkerMock.mockResolvedValueOnce({
+      version: 1,
+      chunkedAudio: true,
+      retainAudio: true,
+      sessionId: "session-1",
+      transcriptId: "earlier-transcript",
+      startedAt: 1_000,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      audioOffsetMs: 0,
+      preserveExistingTranscript: false,
+      ownerUserId: "user-1",
+      memo: "",
+      splitStereoMic: true,
+      untrackedPriorAudio: false,
+    });
+    const { result } = renderHook(() => useStartListening("session-1"));
+    await act(async () => {
+      await result.current();
+    });
+    await act(async () => {
+      await startMock.mock.calls[0]?.[1].onStopped("session-1", {
+        durationSeconds: 42,
+        audioPath: "/tmp/session.wav",
+        requestedLiveTranscription: false,
+        liveTranscriptionActive: false,
+        needsBatchRepair: false,
+      });
+    });
+
+    expect(runBatchMock).toHaveBeenCalledWith(
+      "/tmp/session.wav",
+      expect.objectContaining({ promotion: { scope: "whole_session" } }),
+    );
+    expect(runBatchMock.mock.calls[0]?.[1]).not.toHaveProperty(
+      "splitStereoMic",
+    );
+  });
+
+  test("does not filter bleed across a whole session that includes an earlier non-split capture", async () => {
+    useConfigValueMock.mockImplementation((key) =>
+      key === "ai_language"
+        ? "en"
+        : key === "microphone_split_stereo"
+          ? true
+          : key === "consent_auto_send_chat" || key === "capture_meeting_chat"
+            ? false
+            : [],
+    );
+    loadCaptureLifecycleMarkerMock.mockResolvedValueOnce({
+      version: 1,
+      chunkedAudio: true,
+      retainAudio: true,
+      sessionId: "session-1",
+      transcriptId: "earlier-transcript",
+      startedAt: 1_000,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      audioOffsetMs: 0,
+      preserveExistingTranscript: false,
+      ownerUserId: "user-1",
+      memo: "",
+    });
+    const { result } = renderHook(() => useStartListening("session-1"));
+    await act(async () => {
+      await result.current();
+    });
+    await act(async () => {
+      await startMock.mock.calls[0]?.[1].onStopped("session-1", {
+        durationSeconds: 42,
+        audioPath: "/tmp/session.wav",
+        requestedLiveTranscription: false,
+        liveTranscriptionActive: false,
+        needsBatchRepair: false,
+      });
+    });
+
+    expect(runBatchMock).toHaveBeenCalledWith(
+      "/tmp/session.wav",
+      expect.objectContaining({ promotion: { scope: "whole_session" } }),
+    );
+    expect(runBatchMock.mock.calls[0]?.[1]).not.toHaveProperty(
+      "splitStereoMic",
+    );
+  });
 
   test("does not treat a capture with a committed native transcript as empty", async () => {
     useSessionMock.mockReturnValue({
