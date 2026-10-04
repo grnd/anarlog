@@ -1,5 +1,7 @@
 export type BatchResumeContext = {
   promotion: "whole_session";
+  // The split mode the batch started with; absent means not split.
+  splitStereoMic?: boolean;
 };
 
 export function serializeBatchResumeContext(context: BatchResumeContext) {
@@ -20,7 +22,12 @@ export function parseBatchResumeContext(
     ) {
       return null;
     }
-    return { promotion: "whole_session" };
+    return {
+      promotion: "whole_session",
+      ...("splitStereoMic" in parsed && parsed.splitStereoMic === true
+        ? { splitStereoMic: true }
+        : {}),
+    };
   } catch {
     return null;
   }

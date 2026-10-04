@@ -75,6 +75,7 @@ export function useStartListeningState(
   const spokenLanguages = useConfigValue("spoken_languages");
   const dictionaryTerms = useConfigValue("personalization_dictionary_terms");
   const microphoneDevice = useConfigValue("microphone_device");
+  const splitStereoMic = useConfigValue("microphone_split_stereo");
   const retainAudio =
     normalizeAudioRetention(useConfigValue("audio_retention")) !== "none" ||
     requiresRetainedBatchAudio(conn?.provider, conn?.model);
@@ -117,10 +118,12 @@ export function useStartListeningState(
         hasPendingZeroRetentionAudio(previousMarker))
         ? previousMarker
         : undefined;
+    const splitStereoMicCapture = splitStereoMic === true;
     const lifecycle = createCaptureLifecycle(
       undefined,
       automatic,
       pendingMarker,
+      splitStereoMicCapture,
     );
     // A fresh note or a just-focused window starts listening right as a sync
     // round begins; waiting for that round to yield made the start feel slow
@@ -198,6 +201,7 @@ export function useStartListeningState(
           api_key: conn?.apiKey ?? "",
           keywords,
           mic_device: microphoneDevice || null,
+          split_stereo_mic: splitStereoMicCapture,
           transcription_mode: liveTranscriptionConfig.transcriptionMode,
           participant_human_ids: remoteParticipantHumanIds,
           self_human_id: session?.user_id || null,
@@ -345,6 +349,7 @@ export function useStartListeningState(
     getLiveStartError,
     getSessionMode,
     microphoneDevice,
+    splitStereoMic,
     reportStartFailure,
     retainAudio,
     openNew,

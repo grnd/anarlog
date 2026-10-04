@@ -65,6 +65,7 @@ function ResumeBatchTranscription({
     void runBatch(session.file_path, {
       promotion: { scope: context.promotion },
       resume: { provider: session.provider, model: session.model },
+      ...(context.splitStereoMic ? { splitStereoMic: true } : {}),
     })
       .then(() =>
         getEnhancerService()?.queueAutoEnhanceIfSummaryEmpty(sessionId),

@@ -13,12 +13,17 @@ function renderAudioSettings({
     value: false,
     onChange: vi.fn(),
   },
+  splitStereoMic = {
+    value: false,
+    onChange: vi.fn(),
+  },
 } = {}) {
   return render(
     <AudioSettingsView
       audioRetention={{ value: "forever", onChange: vi.fn() }}
       microphoneDevice={microphoneDevice}
       rememberSpeakers={rememberSpeakers}
+      splitStereoMic={splitStereoMic}
     />,
   );
 }
@@ -56,5 +61,19 @@ describe("AudioSettingsView", () => {
 
     toggle.click();
     expect(onChange).toHaveBeenCalledWith(nextValue);
+  });
+
+  it("toggles split stereo microphone on", () => {
+    const onChange = vi.fn();
+    renderAudioSettings({
+      splitStereoMic: { value: false, onChange },
+    });
+
+    screen
+      .getByRole("switch", {
+        name: "Split stereo microphone into two speakers",
+      })
+      .click();
+    expect(onChange).toHaveBeenCalledWith(true);
   });
 });

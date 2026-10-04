@@ -196,6 +196,8 @@ function SettingsSectionContent({
     "microphone_device",
     storedSettings,
   );
+  const splitStereoMic =
+    resolveConfigValue("microphone_split_stereo", storedSettings) === true;
   const microphoneDevicesQuery = useQuery({
     queryKey: ["microphone-devices"],
     queryFn: async () => {
@@ -375,6 +377,11 @@ function SettingsSectionContent({
                 devices: microphoneDevicesQuery.data ?? [],
                 onChange: (value) =>
                   setSettingValues({ microphone_device: value }),
+              }}
+              splitStereoMic={{
+                value: splitStereoMic,
+                onChange: (value) =>
+                  setSettingValues({ microphone_split_stereo: value }),
               }}
               rememberSpeakers={{
                 value: rememberSpeakers,
