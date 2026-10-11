@@ -29,6 +29,9 @@ pub struct SessionParams {
     pub keywords: Vec<String>,
     #[serde(default)]
     pub mic_device: Option<String>,
+    /// Record the mic's left and right channels as two speakers instead of mic + system audio.
+    #[serde(default)]
+    pub split_stereo_mic: bool,
     #[serde(default)]
     pub participant_human_ids: Vec<String>,
     #[serde(default)]
@@ -178,6 +181,7 @@ mod tests {
             api_key: String::new(),
             keywords: vec![],
             mic_device: None,
+            split_stereo_mic: false,
             participant_human_ids: vec![],
             self_human_id: None,
             speaker_assignments: vec![],

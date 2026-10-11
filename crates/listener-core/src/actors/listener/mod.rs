@@ -74,11 +74,17 @@ pub struct ListenerArgs {
     /// The mic-isolation verdict the streams opened with: every playing output is a headphone
     /// and the mic was not swapped away from the user's Bluetooth headset.
     pub mic_isolated: bool,
+    /// Record per-channel energy and drop cross-channel bleed words (split stereo mic).
+    pub split_stereo_mic: bool,
 }
 
 pub struct ListenerState {
     pub args: ListenerArgs,
     transcript: LiveTranscriptEngine,
+    /// Session-relative ms of the first audio sample this listener sends; the same time base
+    /// the stream's word timestamps are offset by.
+    audio_origin_ms: i64,
+    audio_samples_sent: u64,
     tx: ChannelSender,
     rx_task: tokio::task::JoinHandle<Vec<StreamResponse>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -149,8 +155,18 @@ impl Actor for ListenerActor {
     async fn pre_start(
         &self,
         myself: ActorRef<Self::Msg>,
-        args: Self::Arguments,
+        mut args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
+        // Resolve the stream offset once, before any adapter reads it, so the words' time base
+        // and the recorded audio energy share the same origin. A preset offset means this
+        // listener replaces another and replays audio from that point.
+        let replays_audio = args.stream_offset_secs.is_some();
+        args.stream_offset_secs = resolve_early_offset(
+            args.split_stereo_mic,
+            args.stream_offset_secs,
+            args.session_started_at,
+        );
+        let offset_secs = args.stream_offset_secs.unwrap_or(0.0);
         let session_id = args.session_id.clone();
         let span = session_span(&session_id);
 
@@ -168,11 +184,20 @@ impl Actor for ListenerActor {
                 adapter: adapter_name.clone(),
             });
 
-            let transcript = resume_transcript(&args, &adapter_name);
+            let audio_origin_ms = (offset_secs * 1000.0).round() as i64;
+            let mut transcript = resume_transcript(&args, &adapter_name);
+            if args.split_stereo_mic {
+                transcript.enable_bleed_filter();
+                if replays_audio {
+                    transcript.reset_split_audio_from(audio_origin_ms);
+                }
+            }
 
             let state = ListenerState {
                 args,
                 transcript,
+                audio_origin_ms,
+                audio_samples_sent: 0,
                 tx,
                 rx_task,
                 shutdown_tx: Some(shutdown_tx),
@@ -273,6 +298,10 @@ impl Actor for ListenerActor {
             ListenerMsg::AudioDual(mic, spk, reply) => {
                 let active_samples =
                     stream::active_audio_samples(&mic).max(stream::active_audio_samples(&spk));
+                let split_audio = state
+                    .args
+                    .split_stereo_mic
+                    .then(|| (mic.clone(), spk.clone()));
                 let result = match &state.tx {
                     ChannelSender::Dual(tx) => match tx.try_send(MixedMessage::Audio((mic, spk))) {
                         Ok(()) => ListenerAudioResult::Accepted,
@@ -287,6 +316,12 @@ impl Actor for ListenerActor {
                 };
                 let _ = reply.send(result);
                 if result == ListenerAudioResult::Accepted {
+                    if let Some((mic, spk)) = split_audio {
+                        let start_ms =
+                            split_chunk_start_ms(state.audio_origin_ms, state.audio_samples_sent);
+                        state.transcript.observe_split_audio(start_ms, &mic, &spk);
+                        state.audio_samples_sent += (mic.len() / 2) as u64;
+                    }
                     stop_if_stalled(&myself, state, active_samples);
                 }
                 if matches!(
@@ -573,6 +608,21 @@ fn classify_provider_error(
     }
 }
 
+/// Session time of the next split audio chunk: the listener's stream origin plus the audio
+/// it has already passed to the provider, so energy lines up with the word timestamps.
+/// Only split capture needs the offset before adapters read it (for the audio origin);
+/// otherwise leave it unset so `build_extra` resolves it as before.
+fn resolve_early_offset(split: bool, preset: Option<f64>, started_at: Instant) -> Option<f64> {
+    match (split, preset) {
+        (true, None) => Some(started_at.elapsed().as_secs_f64()),
+        _ => preset,
+    }
+}
+
+fn split_chunk_start_ms(origin_ms: i64, samples_sent: u64) -> i64 {
+    origin_ms + (samples_sent * 1000 / crate::actors::SAMPLE_RATE as u64) as i64
+}
+
 fn stop_with_degraded_error(myself: &ActorRef<ListenerMsg>, error: DegradedError) {
     let reason = serde_json::to_string(&error).ok();
     myself.stop(reason);
@@ -580,6 +630,15 @@ fn stop_with_degraded_error(myself: &ActorRef<ListenerMsg>, error: DegradedError
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn early_offset_resolves_only_in_split_mode() {
+        let t = std::time::Instant::now();
+        assert_eq!(super::resolve_early_offset(false, None, t), None);
+        assert!(super::resolve_early_offset(true, None, t).is_some());
+        assert_eq!(super::resolve_early_offset(false, Some(2.0), t), Some(2.0));
+        assert_eq!(super::resolve_early_offset(true, Some(2.0), t), Some(2.0));
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -614,6 +673,13 @@ mod tests {
         let responses = stop_stream_task(&mut shutdown_tx, &mut task, Duration::from_secs(1)).await;
 
         assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn split_chunks_start_at_the_listener_origin_plus_audio_already_sent() {
+        assert_eq!(split_chunk_start_ms(12_500, 0), 12_500);
+        assert_eq!(split_chunk_start_ms(12_500, 16_000), 13_500);
+        assert_eq!(split_chunk_start_ms(0, 8_000 + 320), 520);
     }
 
     #[test]

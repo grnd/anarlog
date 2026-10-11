@@ -74,6 +74,9 @@ pub struct LiveTranscriptEngine {
     /// during a closed era keep it even after headphones disconnect. An open
     /// era runs to `i64::MAX`.
     isolated_ranges: Vec<(i64, i64)>,
+    /// Per-channel energy of a split stereo mic, used to drop words that are
+    /// only the other lavalier's bleed. `None` leaves words untouched.
+    bleed: Option<anlg_audio_utils::SplitEnergy>,
 }
 
 impl LiveTranscriptEngine {
@@ -133,7 +136,44 @@ impl LiveTranscriptEngine {
             ),
             mic_isolated,
             isolated_ranges,
+            bleed: None,
         }
+    }
+
+    /// Idempotent: the engine outlives listener instances, so the recorded
+    /// energy must survive a reconnect.
+    pub fn enable_bleed_filter(&mut self) {
+        if self.bleed.is_none() {
+            self.bleed = Some(anlg_audio_utils::SplitEnergy::new(
+                crate::actors::SAMPLE_RATE,
+            ));
+        }
+    }
+
+    pub fn observe_split_audio(&mut self, start_ms: i64, left_i16_le: &[u8], right_i16_le: &[u8]) {
+        if let Some(bleed) = self.bleed.as_mut() {
+            bleed.write_i16_le(start_ms, left_i16_le, right_i16_le);
+        }
+    }
+
+    /// A replacing listener resends audio from `ms` on; forget what the previous
+    /// listener recorded there so the replay does not pile onto different audio.
+    pub fn reset_split_audio_from(&mut self, ms: i64) {
+        if let Some(bleed) = self.bleed.as_mut() {
+            bleed.clear_from(ms);
+        }
+    }
+
+    fn drop_bleed_words(&mut self, delta: &mut LiveTranscriptDelta) {
+        let Some(bleed) = self.bleed.as_mut() else {
+            return;
+        };
+        delta.new_words.retain(|w| {
+            let Ok(channel) = usize::try_from(w.channel) else {
+                return true;
+            };
+            !bleed.is_bleed(channel, w.start_ms, w.end_ms)
+        });
     }
 
     pub fn process(&mut self, response: &StreamResponse) -> Option<LiveTranscriptUpdate> {
@@ -162,7 +202,8 @@ impl LiveTranscriptEngine {
             }
             _ => self.processor.process(&normalized)?,
         };
-        let transcript_delta: LiveTranscriptDelta = delta.into();
+        let mut transcript_delta: LiveTranscriptDelta = delta.into();
+        self.drop_bleed_words(&mut transcript_delta);
         let segment_delta = self.rendered_segments.apply_delta(&transcript_delta);
         Some(LiveTranscriptUpdate {
             transcript_delta,
@@ -217,8 +258,9 @@ impl LiveTranscriptEngine {
 
     fn update_from(
         &mut self,
-        transcript_delta: LiveTranscriptDelta,
+        mut transcript_delta: LiveTranscriptDelta,
     ) -> Option<LiveTranscriptUpdate> {
+        self.drop_bleed_words(&mut transcript_delta);
         let segment_delta = self.rendered_segments.apply_delta(&transcript_delta);
         if transcript_delta.is_empty() && segment_delta.is_none() {
             return None;

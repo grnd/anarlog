@@ -65,6 +65,8 @@ pub(in crate::actors) struct Pipeline {
     replay_history: ReplayHistory,
     listener_dispatcher: ListenerDispatcher,
     recorder_dispatcher: RecorderDispatcher,
+    /// Set once per session; `reset` must keep it across stream restarts.
+    split_stereo_mic: bool,
 }
 
 impl Pipeline {
@@ -77,7 +79,12 @@ impl Pipeline {
             listener_dispatcher: ListenerDispatcher::new(),
             recorder_dispatcher: RecorderDispatcher::new(),
             vad_mask: VadMask::default(),
+            split_stereo_mic: false,
         }
+    }
+
+    pub(super) fn set_split_stereo_mic(&mut self, value: bool) {
+        self.split_stereo_mic = value;
     }
 
     pub(super) fn reset(&mut self) {
@@ -144,7 +151,8 @@ impl Pipeline {
             self.dropouts.observe(&frame.capture.raw_mic);
         }
 
-        let (mut processed_mic, processed_spk) = Self::select_tracks(frame, mode);
+        let (mut processed_mic, processed_spk) =
+            Self::select_tracks(frame, mode, self.split_stereo_mic);
         self.vad_mask.process(&mut processed_mic);
         let processed_mic = Arc::<[f32]>::from(processed_mic);
         let item = BufferedAudio::new(processed_mic, processed_spk, mode);
@@ -252,8 +260,16 @@ impl Pipeline {
             .try_send(actor.clone(), mic, spk, mode)
     }
 
-    fn select_tracks(frame: SourceFrame, mode: ChannelMode) -> (Vec<f32>, Arc<[f32]>) {
-        let raw_speaker = Arc::clone(&frame.capture.raw_speaker);
+    fn select_tracks(
+        frame: SourceFrame,
+        mode: ChannelMode,
+        split_stereo_mic: bool,
+    ) -> (Vec<f32>, Arc<[f32]>) {
+        let raw_speaker = if frame.mic_muted && split_stereo_mic {
+            Arc::<[f32]>::from(vec![0.0; frame.capture.raw_speaker.len()])
+        } else {
+            Arc::clone(&frame.capture.raw_speaker)
+        };
 
         let mic_source = match mode {
             ChannelMode::SpeakerOnly => Arc::<[f32]>::from(vec![0.0; raw_speaker.len()]),
@@ -1516,10 +1532,26 @@ mod tests {
                 frame.capture.aec_mic = None;
             }
 
-            let (mic, speaker) = Pipeline::select_tracks(frame, mode);
+            let (mic, speaker) = Pipeline::select_tracks(frame, mode, false);
             assert_eq!(mic, expected_mic, "case: {label}");
             assert_eq!(&*speaker, &[0.75, -0.75, 1.0, -1.0], "case: {label}");
         }
+    }
+
+    #[test]
+    fn muting_split_mic_silences_both_speakers() {
+        let frame = SourceFrame {
+            captured: true,
+            capture: anlg_audio::CaptureFrame {
+                raw_mic: Arc::from(vec![0.5_f32; 4]),
+                raw_speaker: Arc::from(vec![0.5_f32; 4]),
+                aec_mic: None,
+            },
+            mic_muted: true,
+        };
+        let (mic, spk) = Pipeline::select_tracks(frame, ChannelMode::MicAndSpeaker, true);
+        assert_eq!(mic, vec![0.0; 4]);
+        assert_eq!(&*spk, &[0.0; 4]);
     }
 
     fn feed_window(monitor: &mut DropoutMonitor, zero_ratio: f32) {

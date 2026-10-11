@@ -723,6 +723,7 @@ mod tests {
             min_speakers: None,
             max_speakers: None,
             resume_context: None,
+            split_stereo_mic: false,
         }
     }
 

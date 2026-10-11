@@ -803,6 +803,7 @@ mod tests {
                 api_key: "test-key".to_string(),
                 keywords: vec![],
                 mic_device: None,
+                split_stereo_mic: false,
                 participant_human_ids: vec![],
                 self_human_id: None,
                 speaker_assignments: vec![],

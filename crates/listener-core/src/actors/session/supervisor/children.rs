@@ -83,6 +83,7 @@ pub(super) async fn spawn_source(
         SourceActor,
         SourceArgs {
             mic_device: ctx.params.mic_device.clone(),
+            split_stereo_mic: ctx.params.split_stereo_mic,
             onboarding: ctx.params.onboarding,
             runtime: ctx.runtime.clone(),
             audio: ctx.audio.clone(),
@@ -153,6 +154,7 @@ pub(super) async fn spawn_listener(
             speaker_assignments: ctx.params.speaker_assignments.clone(),
             live_transcript: ctx.live_transcript.clone(),
             mic_isolated,
+            split_stereo_mic: ctx.params.split_stereo_mic,
         },
         supervisor_cell,
     )
@@ -173,7 +175,11 @@ pub(super) async fn source_mic_isolated(ctx: &SessionContext) -> bool {
             return isolated;
         }
     }
-    crate::actors::source::mic_isolated(&ctx.params.mic_device, ctx.audio.as_ref())
+    crate::actors::source::mic_isolated(
+        &ctx.params.mic_device,
+        ctx.params.split_stereo_mic,
+        ctx.audio.as_ref(),
+    )
 }
 
 pub(super) async fn try_restart_source(
