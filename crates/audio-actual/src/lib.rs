@@ -248,6 +248,15 @@ impl AudioProvider for ActualAudio {
         capture::open_mic_capture(device, sample_rate, chunk_size)
     }
 
+    fn open_split_mic_capture(
+        &self,
+        device: Option<String>,
+        sample_rate: u32,
+        chunk_size: usize,
+    ) -> Result<CaptureStream, Error> {
+        capture::open_split_mic_capture(device, sample_rate, chunk_size)
+    }
+
     fn default_device_name(&self) -> String {
         AudioInput::get_default_device_name()
     }
@@ -267,6 +276,19 @@ impl AudioProvider for ActualAudio {
     fn probe_mic(&self, device: Option<String>) -> Result<(), Error> {
         let mut input = AudioInput::from_mic(device)?;
         let _stream = input.stream()?;
+        Ok(())
+    }
+
+    fn probe_mic_stereo(&self, device: Option<String>) -> Result<(), Error> {
+        // A hung startup holds the host lock that opening a device needs; don't wait on it.
+        if mic::startup_pending() {
+            return Err(Error::MicStreamInitializationFailed(
+                "previous microphone startup is still pending".into(),
+            ));
+        }
+        if MicInput::new(device)?.channels() < 2 {
+            return Err(Error::MicNotStereo);
+        }
         Ok(())
     }
 

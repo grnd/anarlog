@@ -1,4 +1,5 @@
 use std::{
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -7,11 +8,11 @@ use std::{
 };
 
 use anlg_audio::{CaptureChannel, Error};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::stream::ChunkStream;
+use super::joiner::AudioPair;
 
 static MIC_OPENING: AtomicBool = AtomicBool::new(false);
 static SPEAKER_OPENING: AtomicBool = AtomicBool::new(false);
@@ -32,26 +33,44 @@ const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(4),
 ];
 
-pub(super) struct OpenedChannel {
-    pub stream: ChunkStream,
+/// What one recovering channel delivers per chunk: mono samples, or a split stereo mic's left
+/// and right tracks, which come from one device and so fail and recover as one channel.
+pub(super) trait ChannelChunk: Send + 'static {
+    fn has_audio(&self) -> bool;
+}
+
+impl ChannelChunk for Vec<f32> {
+    fn has_audio(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl ChannelChunk for AudioPair {
+    fn has_audio(&self) -> bool {
+        !self.0.is_empty() || !self.1.is_empty()
+    }
+}
+
+pub(super) struct OpenedChannel<T = Vec<f32>> {
+    pub stream: Pin<Box<dyn Stream<Item = Result<T, anlg_resampler::Error>> + Send>>,
     pub device: Option<String>,
 }
 
-pub(super) enum ChannelItem {
+pub(super) enum ChannelItem<T = Vec<f32>> {
     Ready(CaptureChannel, Option<String>),
     Failed(CaptureChannel, Error),
-    Chunk(CaptureChannel, Vec<f32>),
+    Chunk(CaptureChannel, T),
 }
 
-pub(super) type OpenChannel =
-    Arc<dyn Fn(Option<String>, &[String]) -> Result<OpenedChannel, Error> + Send + Sync>;
+pub(super) type OpenChannel<T = Vec<f32>> =
+    Arc<dyn Fn(Option<String>, &[String]) -> Result<OpenedChannel<T>, Error> + Send + Sync>;
 
-pub(super) async fn run_channel(
+pub(super) async fn run_channel<T: ChannelChunk>(
     channel: CaptureChannel,
-    open: OpenChannel,
+    open: OpenChannel<T>,
     mut device: Option<String>,
     mut retry_rx: mpsc::UnboundedReceiver<(Option<String>, bool)>,
-    tx: mpsc::Sender<ChannelItem>,
+    tx: mpsc::Sender<ChannelItem<T>>,
     cancel: CancellationToken,
 ) {
     let mut failures = 0;
@@ -126,7 +145,7 @@ pub(super) async fn run_channel(
                         item = tokio::time::timeout_at(last_frame + FRAME_TIMEOUT, opened.stream.next()) => item,
                     };
                     match item {
-                        Ok(Some(Ok(data))) if !data.is_empty() => {
+                        Ok(Some(Ok(data))) if data.has_audio() => {
                             last_frame = tokio::time::Instant::now();
                             let started = match healthy_since {
                                 Some(started) => started,

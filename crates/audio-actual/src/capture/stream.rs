@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
@@ -21,7 +21,7 @@ use anlg_audio::{CaptureChannel, CaptureConfig, CaptureEvent, CaptureFrame, Capt
 use crate::mic::MicInput;
 use crate::speaker::SpeakerInput;
 
-use super::joiner::Joiner;
+use super::joiner::{AudioPair, Joiner};
 
 pub(crate) type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<Vec<f32>, anlg_resampler::Error>> + Send>>;
@@ -176,6 +176,163 @@ pub(crate) fn open_recovering(config: CaptureConfig) -> CaptureStream {
         aec_enabled.store(enable_aec, Ordering::Release);
         let _ = speaker_output_retry.send((None, true));
     })
+}
+
+/// Captures a stereo mic's left and right channels as the mic and speaker tracks. Both tracks
+/// come from one device, so they run as a single recovering channel: they become ready, fail,
+/// retry and recover together, and an outage pads both with the same silence.
+pub(crate) fn open_split_recovering(
+    device: Option<String>,
+    sample_rate: u32,
+    chunk_size: usize,
+) -> CaptureStream {
+    let cancel_token = CancellationToken::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let (retry, retry_rx) = tokio::sync::mpsc::unbounded_channel();
+    let requested = Mutex::new(device.clone());
+    let cancel = cancel_token.clone();
+    let task = tokio::spawn(async move {
+        let (pairs_tx, pairs_rx) = tokio::sync::mpsc::channel(32);
+        let pinned = Mutex::new(None);
+        let device = run_channel(
+            CaptureChannel::Mic,
+            Arc::new(move |device, _excluded| {
+                let ((left, right), name) = open_split_mic(device, &pinned)?;
+                let resample = |stream: crate::mic::MicStream| {
+                    stream
+                        .resampled_chunks(sample_rate, chunk_size)
+                        .map(|stream| Box::pin(stream) as ChunkStream)
+                        .map_err(|_| Error::MicStreamSetupFailed)
+                };
+                Ok(OpenedChannel {
+                    stream: Box::pin(LockstepPairs::new(resample(left)?, resample(right)?)),
+                    device: Some(name),
+                })
+            }),
+            device,
+            retry_rx,
+            pairs_tx,
+            cancel.clone(),
+        );
+        let output = run_split_loop(tx, cancel.clone(), sample_rate, chunk_size, pairs_rx);
+        tokio::join!(device, output);
+    });
+    CaptureStream::with_events(CaptureStreamInner {
+        inner: ReceiverStream::new(rx),
+        cancel_token,
+        task,
+    })
+    .with_retry(move |device, force| {
+        let _ = retry.send((split_retry_device(&requested, device), force));
+    })
+}
+
+/// A split capture never follows the default input, so a retry that names no device asks for the
+/// one last requested; a healthy capture then sees no change and keeps running.
+fn split_retry_device(requested: &Mutex<Option<String>>, device: Option<String>) -> Option<String> {
+    let mut requested = requested
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if device.is_some() {
+        *requested = device;
+    }
+    requested.clone()
+}
+
+/// Opens the stereo mic a split capture records from. Its channels are two speakers, so recovery
+/// never moves to another microphone: a capture started on the default input stays on the device
+/// it first opened, and while that device is absent the open fails and is retried.
+fn open_split_mic(
+    device: Option<String>,
+    pinned: &Mutex<Option<String>>,
+) -> Result<((crate::mic::MicStream, crate::mic::MicStream), String), Error> {
+    if crate::mic::startup_pending() {
+        return Err(Error::MicStreamInitializationFailed(
+            "previous microphone startup is still pending".into(),
+        ));
+    }
+    open_pinned(
+        device,
+        pinned,
+        |target| {
+            let input = MicInput::new(target)?;
+            Ok((input.device_name(), input))
+        },
+        MicInput::stream_split,
+    )
+}
+
+fn open_pinned<D, S>(
+    device: Option<String>,
+    pinned: &Mutex<Option<String>>,
+    open: impl FnOnce(Option<String>) -> Result<(String, D), Error>,
+    start: impl FnOnce(&D) -> Result<S, Error>,
+) -> Result<(S, String), Error> {
+    let mut pinned = pinned
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let target = device.or_else(|| pinned.clone());
+    let (name, input) = open(target.clone())?;
+    if let Some(target) = target.filter(|target| *target != name) {
+        return Err(Error::MicStreamInitializationFailed(format!(
+            "split stereo microphone {target} is unavailable"
+        )));
+    }
+    let streams = start(&input)?;
+    *pinned = Some(name.clone());
+    Ok((streams, name))
+}
+
+/// Joins a split mic's left and right chunk streams in lockstep: a late side is waited for,
+/// never silence-filled, and the pair stream ends or fails as soon as either side does.
+struct LockstepPairs {
+    left: ChunkStream,
+    right: ChunkStream,
+    joiner: Joiner,
+}
+
+impl LockstepPairs {
+    fn new(left: ChunkStream, right: ChunkStream) -> Self {
+        Self {
+            left,
+            right,
+            joiner: Joiner::lockstep(),
+        }
+    }
+}
+
+impl Stream for LockstepPairs {
+    type Item = Result<AudioPair, anlg_resampler::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        loop {
+            if let Some(pair) = this.joiner.pop_pair() {
+                return Poll::Ready(Some(Ok(pair)));
+            }
+            let left = this.left.as_mut().poll_next(cx);
+            let right = this.right.as_mut().poll_next(cx);
+            let mut progressed = false;
+            for (polled, is_left) in [(left, true), (right, false)] {
+                match polled {
+                    Poll::Ready(Some(Ok(data))) => {
+                        progressed = true;
+                        if is_left {
+                            this.joiner.push_mic(data);
+                        } else {
+                            this.joiner.push_speaker(data);
+                        }
+                    }
+                    Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                    Poll::Ready(None) => return Poll::Ready(None),
+                    Poll::Pending => {}
+                }
+            }
+            if !progressed {
+                return Poll::Pending;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +496,65 @@ async fn run_dual_loop(
             {
                 return;
             }
+        }
+    }
+}
+
+// A split mic has one device channel: its pairs are emitted as they arrive, and when it fails
+// the elapsed outage is padded on both tracks alike, as for a dual-channel outage.
+async fn run_split_loop(
+    tx: tokio::sync::mpsc::Sender<Result<CaptureEvent, Error>>,
+    cancel_token: CancellationToken,
+    sample_rate: u32,
+    chunk_size: usize,
+    mut pairs: tokio::sync::mpsc::Receiver<ChannelItem<AudioPair>>,
+) {
+    let mut last_frame_at = None;
+    let mut gap = None;
+    let mut clock = tokio::time::interval(std::time::Duration::from_secs_f64(
+        chunk_size as f64 / sample_rate as f64,
+    ));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let item = tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            _ = clock.tick(), if gap.is_some() => {
+                if !emit_gap(&tx, &cancel_token, sample_rate, chunk_size, gap.as_mut().unwrap()).await {
+                    return;
+                }
+                continue;
+            },
+            item = pairs.recv() => item,
+        };
+        let Some(item) = item else {
+            return;
+        };
+        let event = match item {
+            ChannelItem::Ready(channel, device) => {
+                if let Some(mut gap) = gap.take()
+                    && !emit_gap(&tx, &cancel_token, sample_rate, chunk_size, &mut gap).await
+                {
+                    return;
+                }
+                CaptureEvent::ChannelReady { channel, device }
+            }
+            ChannelItem::Failed(channel, error) => {
+                if gap.is_none() {
+                    gap = last_frame_at.map(|at| (at, 0));
+                }
+                CaptureEvent::ChannelFailed { channel, error }
+            }
+            ChannelItem::Chunk(_, (left, right)) => {
+                last_frame_at = Some(tokio::time::Instant::now());
+                CaptureEvent::Frame(CaptureFrame {
+                    raw_mic: Arc::from(left),
+                    raw_speaker: Arc::from(right),
+                    aec_mic: None,
+                })
+            }
+        };
+        if tx.send(Ok(event)).await.is_err() {
+            return;
         }
     }
 }
@@ -800,6 +1016,157 @@ fn segmented_trimmed_gain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_retry_without_a_device_keeps_the_last_requested_one() {
+        let requested = Mutex::new(Some("Wired Receiver".to_string()));
+        assert_eq!(
+            split_retry_device(&requested, None).as_deref(),
+            Some("Wired Receiver")
+        );
+        assert_eq!(
+            split_retry_device(&requested, Some("USB Mic".to_string())).as_deref(),
+            Some("USB Mic")
+        );
+        assert_eq!(
+            split_retry_device(&requested, None).as_deref(),
+            Some("USB Mic")
+        );
+
+        let started_on_default = Mutex::new(None);
+        assert_eq!(split_retry_device(&started_on_default, None), None);
+    }
+
+    #[test]
+    fn split_mic_stays_on_its_device_and_reopens_it_when_it_returns() {
+        let pinned = Mutex::new(None);
+        let present = std::cell::RefCell::new(vec!["Receiver", "MacBook Mic"]);
+        // Like `MicInput::new`: the requested device when present, otherwise the first one listed.
+        let open = |target: Option<String>| -> Result<(String, ()), Error> {
+            let present = present.borrow();
+            let name = target
+                .filter(|target| present.contains(&target.as_str()))
+                .unwrap_or_else(|| present[0].to_string());
+            Ok((name, ()))
+        };
+        let opened = |device: Option<&str>| {
+            open_pinned(device.map(str::to_string), &pinned, open, |_| Ok(())).map(|(_, name)| name)
+        };
+
+        assert_eq!(opened(None).unwrap(), "Receiver");
+
+        present.borrow_mut().remove(0);
+        assert!(opened(None).is_err());
+        assert!(opened(None).is_err());
+
+        present.borrow_mut().insert(0, "Receiver");
+        assert_eq!(opened(None).unwrap(), "Receiver");
+
+        assert_eq!(opened(Some("MacBook Mic")).unwrap(), "MacBook Mic");
+        assert_eq!(opened(None).unwrap(), "MacBook Mic");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn split_mic_failure_recovers_both_tracks_together_and_aligned() {
+        use super::super::recovery::OpenChannel;
+        use futures_util::stream;
+        use std::sync::atomic::AtomicUsize;
+
+        let left = |i: usize| vec![0.1 * i as f32; 10];
+        let right = |i: usize| vec![-0.1 * i as f32; 10];
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let open: OpenChannel<AudioPair> = Arc::new(move |_, _| {
+            let (l, r) = if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+                // The left side runs ahead past the joiner's lag, then the device dies.
+                (
+                    Box::pin(stream::iter((1..=8).map(move |i| Ok(left(i))))) as ChunkStream,
+                    Box::pin(stream::iter([Ok(right(1)), Ok(right(2))]).chain(stream::pending()))
+                        as ChunkStream,
+                )
+            } else {
+                (
+                    Box::pin(stream::iter([Ok(left(9))]).chain(stream::pending())) as ChunkStream,
+                    Box::pin(stream::iter([Ok(right(9))]).chain(stream::pending())) as ChunkStream,
+                )
+            };
+            Ok(OpenedChannel {
+                stream: Box::pin(LockstepPairs::new(l, r)),
+                device: Some("stereo mic".into()),
+            })
+        });
+        let (_retry, retry_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (pairs_tx, pairs_rx) = tokio::sync::mpsc::channel(32);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let cancel = CancellationToken::new();
+        let device = tokio::spawn(run_channel(
+            CaptureChannel::Mic,
+            open,
+            None,
+            retry_rx,
+            pairs_tx,
+            cancel.clone(),
+        ));
+        let output = tokio::spawn(run_split_loop(tx, cancel.clone(), 100, 10, pairs_rx));
+
+        let mut frames = Vec::new();
+        let mut gap_samples = 0;
+        let mut ready = 0;
+        let mut failed = 0;
+        while frames.len() < 3 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+            {
+                CaptureEvent::ChannelReady { channel, .. } => {
+                    assert_eq!(channel, CaptureChannel::Mic);
+                    ready += 1;
+                }
+                CaptureEvent::ChannelFailed { channel, .. } => {
+                    assert_eq!(channel, CaptureChannel::Mic);
+                    failed += 1;
+                }
+                CaptureEvent::Gap(frame) => {
+                    assert_eq!(frame.raw_mic.len(), frame.raw_speaker.len());
+                    assert!(
+                        frame
+                            .raw_mic
+                            .iter()
+                            .chain(frame.raw_speaker.iter())
+                            .all(|sample| *sample == 0.0)
+                    );
+                    gap_samples += frame.raw_mic.len();
+                }
+                CaptureEvent::Frame(frame) => {
+                    assert!(frame.aec_mic.is_none());
+                    frames.push((frame.raw_mic.to_vec(), frame.raw_speaker.to_vec()));
+                }
+            }
+        }
+        cancel.cancel();
+        device.await.unwrap();
+        output.await.unwrap();
+
+        // Left chunks that never got a right partner are dropped with the failed device, never
+        // paired with silence, and both tracks resume together on the reopened device.
+        assert_eq!(
+            frames,
+            vec![
+                (left(1), right(1)),
+                (left(2), right(2)),
+                (left(9), right(9))
+            ]
+        );
+        assert_eq!((ready, failed), (2, 1));
+        assert!(
+            gap_samples >= 50,
+            "the outage must be padded on both tracks, got {gap_samples} samples"
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
 
     #[tokio::test]
     async fn channel_failure_preserves_healthy_audio_and_recovery_restores_stereo_frames() {

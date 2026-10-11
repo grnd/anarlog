@@ -14,6 +14,8 @@ pub enum Error {
     MicStreamSetupFailed,
     #[error("microphone capture initialization failed: {0}")]
     MicStreamInitializationFailed(String),
+    #[error("selected microphone is not stereo")]
+    MicNotStereo,
     #[error("speaker_stream_setup_failed")]
     SpeakerStreamSetupFailed,
     #[error("system audio capture initialization failed: {0}")]
@@ -164,6 +166,18 @@ pub trait AudioProvider: Send + Sync {
         sample_rate: u32,
         chunk_size: usize,
     ) -> Result<CaptureStream, Error>;
+    /// Captures the mic's left and right channels as two tracks (`raw_mic` = left,
+    /// `raw_speaker` = right) instead of downmixing them. No system audio is captured. Both
+    /// tracks come from one device, so they fail and recover together as the `Mic` channel.
+    fn open_split_mic_capture(
+        &self,
+        device: Option<String>,
+        sample_rate: u32,
+        chunk_size: usize,
+    ) -> Result<CaptureStream, Error> {
+        let _ = (device, sample_rate, chunk_size);
+        Err(Error::MicNotStereo)
+    }
 
     fn default_device_name(&self) -> String;
     fn list_mic_devices(&self) -> Vec<String>;
@@ -172,6 +186,12 @@ pub trait AudioProvider: Send + Sync {
     fn play_bytes(&self, bytes: &'static [u8]) -> std::sync::mpsc::Sender<()>;
 
     fn probe_mic(&self, device: Option<String>) -> Result<(), Error>;
+    /// Checks that the mic has the two channels `open_split_mic_capture` needs, without
+    /// starting a stream.
+    fn probe_mic_stereo(&self, device: Option<String>) -> Result<(), Error> {
+        let _ = device;
+        Err(Error::MicNotStereo)
+    }
     fn probe_speaker(&self) -> Result<(), Error>;
 }
 

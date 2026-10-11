@@ -25,3 +25,15 @@ pub(crate) fn open_mic_capture(
     let mic_stream = setup_mic_stream(sample_rate, chunk_size, device)?;
     Ok(stream::open_single(mic_stream, CaptureSide::Mic))
 }
+
+pub(crate) fn open_split_mic_capture(
+    device: Option<String>,
+    sample_rate: u32,
+    chunk_size: usize,
+) -> Result<CaptureStream, Error> {
+    Ok(stream::open_split_recovering(
+        device,
+        sample_rate,
+        chunk_size,
+    ))
+}
