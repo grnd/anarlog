@@ -1,4 +1,5 @@
 mod accumulator;
+mod bleed;
 mod consolidate;
 mod diarize;
 mod progressive;
@@ -135,6 +136,9 @@ pub struct BatchParams {
     /// provider.
     #[serde(default)]
     pub known_speakers: Vec<KnownSpeaker>,
+    /// Recorded with a split stereo mic: drop words that are the other channel's bleed.
+    #[serde(default)]
+    pub split_stereo_mic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -274,9 +278,22 @@ async fn run_batch_inner(
     }?;
 
     let (runtime, params, listen_params) = post_process;
+    if params.split_stereo_mic {
+        drop_bleed(&params.file_path, &mut output.response).await;
+    }
     apply_local_diarization(runtime.clone(), &params, &listen_params, &mut output).await;
     consolidate_hosted_speakers(runtime, &params, &listen_params, &mut output).await;
     Ok(output)
+}
+
+async fn drop_bleed(file_path: &str, response: &mut owhisper_interface::batch::Response) {
+    let path = file_path.to_string();
+    match tokio::task::spawn_blocking(move || bleed::stereo_energy(&path)).await {
+        Ok(Ok(Some(mut energy))) => bleed::drop_cross_channel_bleed(response, &mut energy),
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => tracing::warn!(error, "batch_bleed_filter_failed"),
+        Err(error) => tracing::warn!(error = %error, "batch_bleed_filter_failed"),
+    }
 }
 
 fn resolve_batch_adapter_kind(
@@ -417,6 +434,7 @@ mod tests {
             min_speakers: None,
             max_speakers: None,
             known_speakers: vec![],
+            split_stereo_mic: false,
         }
     }
 

@@ -27,6 +27,7 @@ pub(super) fn params(provider: BatchProvider, base_url: &str, file_path: &str) -
         min_speakers: None,
         max_speakers: None,
         known_speakers: vec![],
+        split_stereo_mic: false,
     }
 }
 

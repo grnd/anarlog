@@ -11,11 +11,13 @@ use crate::actors::session::lifecycle::{
     clear_sentry_session_context, configure_sentry_session_context, emit_session_ended,
 };
 use crate::actors::{
-    SessionConfigUpdate, SessionContext, SessionMsg, SessionParams, session_span,
+    ChannelMode, SessionConfigUpdate, SessionContext, SessionMsg, SessionParams, session_span,
     spawn_session_supervisor,
 };
 use crate::{ListenerRuntime, SessionLifecycleEvent, Snapshot, StartSessionError, State};
 use anlg_audio::AudioProvider;
+
+const SPLIT_MIC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub enum RootMsg {
     RetryCleanup,
@@ -301,6 +303,30 @@ async fn start_session_impl(
         if state.finalizing_sessions.contains_key(&params.session_id) {
             tracing::warn!("session_is_still_finalizing");
             return Err(StartSessionError::SessionAlreadyRunning);
+        }
+
+        // The source opens the device only after the session is running, where a mono input
+        // would fail every restart; check it up front so the start is rejected instead.
+        if params.split_stereo_mic
+            && ChannelMode::determine(params.onboarding) == ChannelMode::MicAndSpeaker
+        {
+            let audio = state.audio.clone();
+            let mic_device = params.mic_device.clone();
+            let probe = tokio::task::spawn_blocking(move || {
+                crate::actors::source::probe_split_mic(mic_device, audio.as_ref())
+            });
+            // A native call can block indefinitely; past the deadline the session starts and the
+            // source reports the device instead of the root actor waiting on it.
+            match tokio::time::timeout(SPLIT_MIC_PROBE_TIMEOUT, probe).await {
+                Ok(Ok(Err(anlg_audio::Error::MicNotStereo))) => {
+                    tracing::warn!("split_stereo_mic_not_stereo");
+                    return Err(StartSessionError::MicNotStereo);
+                }
+                Ok(Ok(Err(error))) => tracing::warn!(%error, "split_stereo_mic_probe_failed"),
+                Ok(Ok(Ok(()))) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "split_stereo_mic_probe_panicked"),
+                Err(_) => tracing::warn!("split_stereo_mic_probe_timed_out"),
+            }
         }
 
         configure_sentry_session_context(&params);
@@ -734,6 +760,51 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(state, ractor::rpc::CallResult::Success(_)));
+        root.stop(None);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn split_stereo_start_is_rejected_before_a_session_runs_on_a_mono_mic() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Runtime(dir.path().to_path_buf(), Default::default()));
+        let (root, task) = Actor::spawn(
+            None,
+            RootActor,
+            RootArgs {
+                runtime: runtime.clone(),
+                audio: runtime,
+            },
+        )
+        .await
+        .unwrap();
+        let params = SessionParams {
+            session_id: "split-mono".to_string(),
+            retain_audio: None,
+            languages: vec![],
+            onboarding: false,
+            transcription_mode: Default::default(),
+            model: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            keywords: vec![],
+            mic_device: Some("mono-mic".to_string()),
+            split_stereo_mic: true,
+            participant_human_ids: vec![],
+            self_human_id: None,
+            speaker_assignments: vec![],
+        };
+
+        let result = ractor::call!(root, RootMsg::StartSession, params).unwrap();
+        assert_eq!(result, Err(StartSessionError::MicNotStereo));
+        assert!(
+            ractor::registry::where_is(crate::actors::session_supervisor_name("split-mono"))
+                .is_none()
+        );
+        let snapshot = ractor::call!(root, RootMsg::GetSnapshot).unwrap();
+        assert_eq!(snapshot.state, State::Inactive);
+        assert!(snapshot.active_session_id.is_none());
+
         root.stop(None);
         task.await.unwrap();
     }

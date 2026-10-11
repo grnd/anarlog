@@ -1086,3 +1086,86 @@ fn nari_empty_final_clears_only_its_preview_and_never_persists_unconfirmed_text(
     let flushed = engine.flush();
     assert!(flushed.is_none_or(|update| update.transcript_delta.new_words.is_empty()));
 }
+
+fn loud_left_quiet_right_ms(ms: usize) -> (Vec<u8>, Vec<u8>) {
+    let samples = 16 * ms;
+    let wave = |amp: f32| -> Vec<u8> {
+        (0..samples)
+            .flat_map(|i| ((amp * ((i as f32) * 0.07).sin() * 32767.0) as i16).to_le_bytes())
+            .collect()
+    };
+    (wave(0.5), wave(0.05))
+}
+
+// Final words are held until the next word or a flush, so each response is
+// flushed to read back everything it produced.
+fn settled_update(
+    engine: &mut LiveTranscriptEngine,
+    response: &StreamResponse,
+) -> (Vec<FinalizedWord>, Vec<LiveTranscriptSegment>) {
+    let mut words = Vec::new();
+    let mut segments = Vec::new();
+    for update in [engine.process(response), engine.flush()]
+        .into_iter()
+        .flatten()
+    {
+        words.extend(update.transcript_delta.new_words);
+        segments.extend(update.segment_delta.into_iter().flat_map(|d| d.upserts));
+    }
+    (words, segments)
+}
+
+#[test]
+fn split_mode_drops_the_quiet_copy_on_the_other_channel() {
+    let mut engine = LiveTranscriptEngine::new("deepgram", &[], None);
+    engine.enable_bleed_filter();
+    let (left, right) = loud_left_quiet_right_ms(2_000);
+    engine.observe_split_audio(0, &left, &right);
+
+    let hello = |channel| {
+        transcript_response_at(
+            "hello",
+            vec![word("hello", 0.2, 0.6)],
+            true,
+            channel,
+            0.0,
+            1.0,
+        )
+    };
+    let (kept, _) = settled_update(&mut engine, &hello(0));
+    assert_eq!(kept.len(), 1);
+
+    let (dropped, segments) = settled_update(&mut engine, &hello(1));
+    assert!(dropped.is_empty());
+    assert!(segments.is_empty());
+}
+
+#[test]
+fn without_split_mode_the_quiet_copy_is_kept() {
+    let mut engine = LiveTranscriptEngine::new("deepgram", &[], None);
+    let (left, right) = loud_left_quiet_right_ms(2_000);
+    engine.observe_split_audio(0, &left, &right);
+    let response =
+        transcript_response_at("hello", vec![word("hello", 0.2, 0.6)], true, 1, 0.0, 1.0);
+    let (kept, _) = settled_update(&mut engine, &response);
+    assert_eq!(kept.len(), 1);
+}
+
+#[test]
+fn replayed_split_audio_replaces_what_the_previous_listener_recorded() {
+    let mut engine = LiveTranscriptEngine::new("deepgram", &[], None);
+    engine.enable_bleed_filter();
+    let (left, right) = loud_left_quiet_right_ms(1_000);
+    engine.observe_split_audio(0, &left, &right);
+    // The first listener heard both speakers at once from 1 s on...
+    let (both, _) = loud_left_quiet_right_ms(1_000);
+    engine.observe_split_audio(1_000, &both, &both);
+    // ...but the replay listener's audio from 1 s is the left speaker alone.
+    engine.reset_split_audio_from(1_000);
+    engine.observe_split_audio(1_000, &left, &right);
+
+    let response =
+        transcript_response_at("hello", vec![word("hello", 1.2, 1.6)], true, 1, 1.0, 1.0);
+    let (kept, _) = settled_update(&mut engine, &response);
+    assert!(kept.is_empty());
+}

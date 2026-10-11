@@ -68,4 +68,6 @@ pub enum StartSessionError {
     FailedToResolveSessionsDir,
     #[serde(rename = "failed_to_start_session")]
     FailedToStartSession,
+    #[serde(rename = "mic_not_stereo")]
+    MicNotStereo,
 }

@@ -30,6 +30,9 @@ pub struct InheritedCapture {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The split stereo mic mode this capture started with; absent means not split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_stereo_mic: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, specta::Type)]
@@ -62,6 +65,13 @@ pub struct CaptureLifecycleMarker {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The split stereo mic mode the capture started with; absent means not split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_stereo_mic: Option<bool>,
+    /// Split captures only: the session already had audio no inherited capture accounts for;
+    /// absent means unknown, so treated as present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untracked_prior_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_mode: Option<SummaryMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +138,11 @@ pub fn parse_marker(value_json: &str, session_id: &str) -> Option<CaptureLifecyc
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string),
+        split_stereo_mic: object
+            .get("splitStereoMic")
+            .and_then(Value::as_bool)
+            .filter(|value| *value),
+        untracked_prior_audio: object.get("untrackedPriorAudio").and_then(Value::as_bool),
         summary_mode: object.get("summaryMode").and_then(Value::as_str).and_then(
             |mode| match mode {
                 "regenerate" => Some(SummaryMode::Regenerate),
@@ -204,6 +219,10 @@ fn parse_inherited_capture(value: &Value) -> Option<InheritedCapture> {
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string),
+        split_stereo_mic: object
+            .get("splitStereoMic")
+            .and_then(Value::as_bool)
+            .filter(|value| *value),
     })
 }
 
@@ -317,6 +336,8 @@ mod tests {
             memo: "memo".to_string(),
             provider: Some("provider".to_string()),
             model: Some("model".to_string()),
+            split_stereo_mic: Some(true),
+            untracked_prior_audio: Some(false),
             summary_mode: Some(SummaryMode::IfEmpty),
             refresh_summary_after_repair: Some(true),
             inherited_captures: Some(vec![InheritedCapture {
@@ -328,6 +349,7 @@ mod tests {
                 retain_audio: Some(true),
                 provider: Some("provider-2".to_string()),
                 model: Some("model-2".to_string()),
+                split_stereo_mic: Some(true),
             }]),
             inherited_only: Some(true),
         };

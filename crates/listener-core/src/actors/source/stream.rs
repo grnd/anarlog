@@ -27,7 +27,7 @@ pub(super) async fn start_source_loop(
 
     st.active_mic_device = active_mic_device(st.mic_device.clone(), st.audio.as_ref());
     let mic_swapped = st.mic_device.is_none() && st.active_mic_device.is_some();
-    let capture = capture_settings(mic_swapped);
+    let capture = capture_settings(mic_swapped).with_split_stereo_mic(st.split_stereo_mic);
     st.capture_mic_isolated = capture.mic_isolated;
     let result = start_streams(myself, st, capture).await;
 
@@ -43,6 +43,21 @@ pub(super) struct CaptureSettings {
     /// user. Not claimed when the mic was swapped away from the user's Bluetooth headset: the
     /// headset mic sat on their head, the replacement is a room mic as far as we know.
     pub(super) mic_isolated: bool,
+}
+
+impl CaptureSettings {
+    // Both split channels come from one device, so there is no echo path to cancel, and the left
+    // channel is the wearer's own lavalier whatever the output route.
+    pub(super) fn with_split_stereo_mic(self, split_stereo_mic: bool) -> Self {
+        if !split_stereo_mic {
+            return self;
+        }
+        Self {
+            enable_aec: false,
+            mic_isolated: true,
+            ..self
+        }
+    }
 }
 
 // Headphones make AEC pure cost: it burns CPU and can degrade near-end speech. The check covers
@@ -117,6 +132,7 @@ async fn start_streams(
     let myself2 = myself.clone();
     let mic_muted = st.mic_muted.clone();
     let mic_device = st.active_mic_device.clone();
+    let split_stereo_mic = st.split_stereo_mic;
     let audio = st.audio.clone();
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(CAPTURE_FRAME_QUEUE_CAPACITY);
     let wake_pending = st.capture_wake_pending.clone();
@@ -137,6 +153,7 @@ async fn start_streams(
             mic_muted,
             mic_device,
             enable_aec: capture.enable_aec,
+            split_stereo_mic,
             audio,
             frame_tx,
             wake_pending,
@@ -157,6 +174,7 @@ struct StreamContext {
     mic_muted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mic_device: Option<String>,
     enable_aec: bool,
+    split_stereo_mic: bool,
     audio: std::sync::Arc<dyn AudioProvider>,
     frame_tx: tokio::sync::mpsc::Sender<SourceFrame>,
     wake_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -189,6 +207,10 @@ async fn run_stream_loop(mut ctx: StreamContext, mode: ChannelMode) {
     let chunk_size = chunk_size_for_stt(sample_rate);
 
     let capture_result: Result<CaptureStream, _> = match mode {
+        ChannelMode::MicAndSpeaker if ctx.split_stereo_mic => {
+            ctx.audio
+                .open_split_mic_capture(ctx.mic_device.clone(), sample_rate, chunk_size)
+        }
         ChannelMode::MicAndSpeaker => {
             let config = CaptureConfig {
                 sample_rate,
@@ -315,6 +337,19 @@ async fn handle_capture_item(
 #[cfg(test)]
 mod tests {
     use super::{CaptureSettings, resolve_capture_settings};
+
+    #[test]
+    fn split_stereo_mic_isolates_the_mic_and_skips_aec() {
+        for headphone_output in [false, true] {
+            let settings =
+                resolve_capture_settings(false, headphone_output, true).with_split_stereo_mic(true);
+            assert!(settings.mic_isolated, "headphones: {headphone_output}");
+            assert!(!settings.enable_aec, "headphones: {headphone_output}");
+        }
+
+        let default = resolve_capture_settings(false, false, false);
+        assert_eq!(default.with_split_stereo_mic(false), default);
+    }
 
     #[test]
     fn resolve_capture_settings_by_output_route() {

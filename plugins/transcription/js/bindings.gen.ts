@@ -1000,6 +1000,15 @@ export type CaptureLifecycleMarker = {
   memo: string;
   provider?: string | null;
   model?: string | null;
+  /**
+   * The split stereo mic mode the capture started with; absent means not split.
+   */
+  splitStereoMic?: boolean | null;
+  /**
+   * Split captures only: the session already had audio no inherited capture accounts for;
+   * absent means unknown, so treated as present.
+   */
+  untrackedPriorAudio?: boolean | null;
   summaryMode?: SummaryMode | null;
   refreshSummaryAfterRepair?: boolean | null;
   inheritedCaptures?: InheritedCapture[] | null;
@@ -1016,6 +1025,7 @@ export type CaptureParams = {
   api_key: string;
   keywords: string[];
   mic_device?: string | null;
+  split_stereo_mic?: boolean;
   transcription_mode?: TranscriptionMode | null;
   participant_human_ids?: string[];
   self_human_id?: string | null;
@@ -1083,6 +1093,10 @@ export type InheritedCapture = {
   retainAudio?: boolean | null;
   provider?: string | null;
   model?: string | null;
+  /**
+   * The split stereo mic mode this capture started with; absent means not split.
+   */
+  splitStereoMic?: boolean | null;
 };
 export type JsonValue =
   | null
@@ -1357,6 +1371,7 @@ export type TranscriptionParams = {
   min_speakers?: number | null;
   max_speakers?: number | null;
   resume_context?: string | null;
+  split_stereo_mic?: boolean;
 };
 export type TranscriptionSession = {
   session_id: string;
