@@ -473,26 +473,97 @@ impl MicInput {
     pub fn sample_rate(&self) -> u32 {
         self.config.sample_rate()
     }
+
+    pub fn channels(&self) -> u16 {
+        self.config.channels()
+    }
+}
+
+struct ChannelSink {
+    producer: HeapProd<f32>,
+    waker: Arc<AtomicWaker>,
+    wake_pending: Arc<AtomicBool>,
+}
+
+impl ChannelSink {
+    fn wake_if_pending(&self) {
+        if self.wake_pending.load(Ordering::Acquire) {
+            self.wake_pending.store(false, Ordering::Release);
+            self.waker.wake();
+        }
+    }
+}
+
+enum Sinks {
+    Mono(ChannelSink),
+    Split(ChannelSink, ChannelSink),
+}
+
+impl Sinks {
+    fn wakers(&self) -> Vec<Arc<AtomicWaker>> {
+        match self {
+            Sinks::Mono(sink) => vec![sink.waker.clone()],
+            Sinks::Split(left, right) => vec![left.waker.clone(), right.waker.clone()],
+        }
+    }
+}
+
+fn wake_all(wakers: &[Arc<AtomicWaker>]) {
+    for waker in wakers {
+        waker.wake();
+    }
 }
 
 impl MicInput {
     pub fn stream(&self) -> Result<MicStream, crate::Error> {
+        self.open_stream(false).map(|(mono, _)| mono)
+    }
+
+    /// Opens the device once and yields its left and right channels as separate streams.
+    pub fn stream_split(&self) -> Result<(MicStream, MicStream), crate::Error> {
+        if self.config.channels() < 2 {
+            return Err(crate::Error::MicNotStereo);
+        }
+        let (left, right) = self.open_stream(true)?;
+        Ok((left, right.expect("split capture opens a right channel")))
+    }
+
+    fn open_stream(&self, split: bool) -> Result<(MicStream, Option<MicStream>), crate::Error> {
         let startup_permit = StartupPermit::acquire()?;
         let config = self.config.clone();
         let device = self.handles.device().clone();
         let (drop_tx, drop_rx) = std::sync::mpsc::channel();
         let (init_tx, init_rx) = std::sync::mpsc::channel();
 
-        let rb = HeapRb::<f32>::new(MIC_BUFFER_SIZE);
-        let (producer, consumer) = rb.split();
+        let new_channel = || {
+            let rb = HeapRb::<f32>::new(MIC_BUFFER_SIZE);
+            let (producer, consumer) = rb.split();
+            let waker = Arc::new(AtomicWaker::new());
+            let wake_pending = Arc::new(AtomicBool::new(false));
+            let reader_parts = (consumer, waker.clone(), wake_pending.clone());
+            (
+                ChannelSink {
+                    producer,
+                    waker,
+                    wake_pending,
+                },
+                reader_parts,
+            )
+        };
+        let (first_sink, first_parts) = new_channel();
+        let second = split.then(new_channel);
+        let (sinks, reader_parts) = match second {
+            Some((second_sink, second_parts)) => (
+                Sinks::Split(first_sink, second_sink),
+                vec![first_parts, second_parts],
+            ),
+            None => (Sinks::Mono(first_sink), vec![first_parts]),
+        };
+        let wakers_for_thread = sinks.wakers();
 
-        let waker = Arc::new(AtomicWaker::new());
-        let wake_pending = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
         let dropped_samples = Arc::new(AtomicUsize::new(0));
 
-        let waker_for_thread = waker.clone();
-        let wake_pending_for_thread = wake_pending.clone();
         let alive_for_thread = alive.clone();
         let dropped_for_thread = dropped_samples.clone();
 
@@ -500,39 +571,55 @@ impl MicInput {
             fn build_stream<S: ToSample<f32> + SizedSample>(
                 device: &cpal::Device,
                 config: &cpal::SupportedStreamConfig,
-                mut producer: HeapProd<f32>,
-                waker: Arc<AtomicWaker>,
-                wake_pending: Arc<AtomicBool>,
+                mut sinks: Sinks,
                 dropped_samples: Arc<AtomicUsize>,
                 alive: Arc<AtomicBool>,
             ) -> Result<cpal::Stream, cpal::BuildStreamError> {
                 let channels = config.channels() as usize;
                 let mut scratch = vec![0.0f32; crate::rt_ring::DEFAULT_SCRATCH_LEN];
-                let waker_for_err = waker.clone();
+                let wakers_for_err = sinks.wakers();
                 let alive_for_err = alive.clone();
                 device.build_input_stream::<S, _, _>(
                     &config.config(),
                     move |data: &[S], _input_callback_info: &_| {
-                        let stats = crate::rt_ring::push_interleaved_downmix_to_mono_ringbuf(
-                            data,
-                            channels,
-                            &mut scratch,
-                            &mut producer,
-                        );
+                        let stats = match &mut sinks {
+                            Sinks::Mono(sink) => {
+                                crate::rt_ring::push_interleaved_downmix_to_mono_ringbuf(
+                                    data,
+                                    channels,
+                                    &mut scratch,
+                                    &mut sink.producer,
+                                )
+                            }
+                            Sinks::Split(left, right) => {
+                                crate::rt_ring::push_interleaved_first_two_channels_ringbuf(
+                                    data,
+                                    channels,
+                                    &mut scratch,
+                                    &mut left.producer,
+                                    &mut right.producer,
+                                )
+                            }
+                        };
 
                         if stats.dropped > 0 {
                             dropped_samples.fetch_add(stats.dropped, Ordering::Relaxed);
                         }
 
-                        if stats.pushed > 0 && wake_pending.load(Ordering::Acquire) {
-                            wake_pending.store(false, Ordering::Release);
-                            waker.wake();
+                        if stats.pushed > 0 {
+                            match &sinks {
+                                Sinks::Mono(sink) => sink.wake_if_pending(),
+                                Sinks::Split(left, right) => {
+                                    left.wake_if_pending();
+                                    right.wake_if_pending();
+                                }
+                            }
                         }
                     },
                     move |err| {
                         tracing::error!(error = %err, "mic_stream_error");
                         alive_for_err.store(false, Ordering::Release);
-                        waker_for_err.wake();
+                        wake_all(&wakers_for_err);
                     },
                     None,
                 )
@@ -543,36 +630,28 @@ impl MicInput {
                     cpal::SampleFormat::I8 => build_stream::<i8>(
                         &device,
                         &config,
-                        producer,
-                        waker_for_thread.clone(),
-                        wake_pending_for_thread.clone(),
+                        sinks,
                         dropped_for_thread.clone(),
                         alive_for_thread.clone(),
                     ),
                     cpal::SampleFormat::I16 => build_stream::<i16>(
                         &device,
                         &config,
-                        producer,
-                        waker_for_thread.clone(),
-                        wake_pending_for_thread.clone(),
+                        sinks,
                         dropped_for_thread.clone(),
                         alive_for_thread.clone(),
                     ),
                     cpal::SampleFormat::I32 => build_stream::<i32>(
                         &device,
                         &config,
-                        producer,
-                        waker_for_thread.clone(),
-                        wake_pending_for_thread.clone(),
+                        sinks,
                         dropped_for_thread.clone(),
                         alive_for_thread.clone(),
                     ),
                     cpal::SampleFormat::F32 => build_stream::<f32>(
                         &device,
                         &config,
-                        producer,
-                        waker_for_thread.clone(),
-                        wake_pending_for_thread.clone(),
+                        sinks,
                         dropped_for_thread.clone(),
                         alive_for_thread.clone(),
                     ),
@@ -608,7 +687,7 @@ impl MicInput {
                 Err(error) => {
                     let _ = init_tx.send(Err(error));
                     alive_for_thread.store(false, Ordering::Release);
-                    waker_for_thread.wake();
+                    wake_all(&wakers_for_thread);
                     with_cpal_host_lock(|| drop_quietly(device));
                     return;
                 }
@@ -618,7 +697,7 @@ impl MicInput {
             let _ = drop_rx.recv();
 
             alive_for_thread.store(false, Ordering::Release);
-            waker_for_thread.wake();
+            wake_all(&wakers_for_thread);
             with_cpal_host_lock(|| {
                 drop_quietly(stream);
                 drop_quietly(device);
@@ -651,8 +730,9 @@ impl MicInput {
             }
         }
 
-        Ok(MicStream {
-            drop_tx,
+        let stop = Arc::new(StopCapture(drop_tx));
+        let make_stream = |(consumer, waker, wake_pending)| MicStream {
+            _stop: stop.clone(),
             config: self.config.clone(),
             _bluetooth: self.bluetooth.clone(),
             reader: RingbufAsyncReader::new(
@@ -661,23 +741,29 @@ impl MicInput {
                 wake_pending,
                 vec![0.0f32; MIC_READ_CHUNK_SIZE],
             )
-            .with_alive(alive)
-            .with_dropped_samples(dropped_samples, "mic_samples_dropped"),
-        })
+            .with_alive(alive.clone())
+            .with_dropped_samples(dropped_samples.clone(), "mic_samples_dropped"),
+        };
+        let mut reader_parts = reader_parts.into_iter();
+        let left = make_stream(reader_parts.next().expect("at least one channel"));
+        let right = reader_parts.next().map(make_stream);
+        Ok((left, right))
+    }
+}
+
+struct StopCapture(std::sync::mpsc::Sender<()>);
+
+impl Drop for StopCapture {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
     }
 }
 
 pub struct MicStream {
-    drop_tx: std::sync::mpsc::Sender<()>,
+    _stop: Arc<StopCapture>,
     config: cpal::SupportedStreamConfig,
     _bluetooth: Option<Arc<anlg_audio_device::BluetoothInputActivation>>,
     reader: RingbufAsyncReader<HeapCons<f32>>,
-}
-
-impl Drop for MicStream {
-    fn drop(&mut self) {
-        let _ = self.drop_tx.send(());
-    }
 }
 
 impl Stream for MicStream {

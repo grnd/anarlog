@@ -98,6 +98,51 @@ where
     }
 }
 
+/// Pushes the first two channels of interleaved frames into separate ring buffers so a stereo
+/// input can carry two speakers. Channels past the second are ignored; frames are dropped on
+/// both sides together when either buffer is full, so the two streams stay frame-aligned.
+pub(crate) fn push_interleaved_first_two_channels_ringbuf<S, P>(
+    data: &[S],
+    channels: usize,
+    scratch: &mut [f32],
+    left: &mut P,
+    right: &mut P,
+) -> PushStats
+where
+    S: Copy + ToSample<f32>,
+    P: Producer<Item = f32>,
+{
+    if scratch.is_empty() || channels < 2 {
+        return PushStats::default();
+    }
+
+    let frame_count = data.len() / channels;
+    let mut stats = PushStats::default();
+
+    let mut offset = 0usize;
+    while offset < frame_count {
+        let count = (frame_count - offset).min(scratch.len());
+        let writable = count.min(left.vacant_len()).min(right.vacant_len());
+        if writable == 0 {
+            stats.dropped += 2 * (frame_count - offset);
+            break;
+        }
+
+        for (channel, producer) in [(0usize, &mut *left), (1usize, &mut *right)] {
+            for (i, slot) in scratch[..writable].iter_mut().enumerate() {
+                *slot = data[(offset + i) * channels + channel].to_sample_();
+            }
+            producer.push_slice(&scratch[..writable]);
+        }
+
+        stats.pushed += 2 * writable;
+        stats.dropped += 2 * (count - writable);
+        offset += count;
+    }
+
+    stats
+}
+
 pub(crate) fn convert_and_push_to_ringbuf<T, P>(
     samples: &[T],
     scratch: &mut [f32],
@@ -272,5 +317,43 @@ mod tests {
         let read = consumer.pop_slice(&mut out);
         assert_eq!(read, 2);
         assert_eq!(out, vec![0.4, 0.3]);
+    }
+
+    #[test]
+    fn split_first_two_channels_drops_frames_on_both_sides_together() {
+        let (mut left_producer, mut left_consumer) = HeapRb::<f32>::new(8).split();
+        let (mut right_producer, mut right_consumer) = HeapRb::<f32>::new(2).split();
+        let mut scratch = vec![0.0; 8];
+
+        // Three channels per frame; the third is ignored. Right buffer only fits two frames.
+        let stats = push_interleaved_first_two_channels_ringbuf(
+            &[0.1_f32, 0.9, 0.5, 0.2, 0.8, 0.5, 0.3, 0.7, 0.5],
+            3,
+            &mut scratch,
+            &mut left_producer,
+            &mut right_producer,
+        );
+
+        assert_eq!(stats.pushed, 4);
+        assert_eq!(stats.dropped, 2);
+        let mut left = vec![0.0; left_consumer.occupied_len()];
+        left_consumer.pop_slice(&mut left);
+        let mut right = vec![0.0; right_consumer.occupied_len()];
+        right_consumer.pop_slice(&mut right);
+        assert_eq!(left, vec![0.1, 0.2]);
+        assert_eq!(right, vec![0.9, 0.8]);
+
+        // Right drained: the next frame lands on both sides, so alignment continues.
+        let stats = push_interleaved_first_two_channels_ringbuf(
+            &[0.4_f32, 0.6, 0.5],
+            3,
+            &mut scratch,
+            &mut left_producer,
+            &mut right_producer,
+        );
+        assert_eq!(stats.pushed, 2);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(left_consumer.try_pop(), Some(0.4));
+        assert_eq!(right_consumer.try_pop(), Some(0.6));
     }
 }
