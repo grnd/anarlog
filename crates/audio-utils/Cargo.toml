@@ -10,6 +10,8 @@ anlg-resampler = { workspace = true }
 audioadapter-buffers = "2.0"
 bytes = { workspace = true }
 futures-util = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
@@ -20,3 +22,4 @@ vorbis_rs = { workspace = true }
 
 [dev-dependencies]
 anlg-data = { workspace = true }
+tempfile = { workspace = true }
