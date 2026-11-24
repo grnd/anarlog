@@ -1,4 +1,5 @@
 use std::{
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -7,11 +8,11 @@ use std::{
 };
 
 use anlg_audio::{CaptureChannel, Error};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::stream::ChunkStream;
+use super::joiner::AudioPair;
 
 static MIC_OPENING: AtomicBool = AtomicBool::new(false);
 static SPEAKER_OPENING: AtomicBool = AtomicBool::new(false);
@@ -32,26 +33,44 @@ const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(4),
 ];
 
-pub(super) struct OpenedChannel {
-    pub stream: ChunkStream,
+/// What one recovering channel delivers per chunk: mono samples, or a split stereo mic's left
+/// and right tracks, which come from one device and so fail and recover as one channel.
+pub(super) trait ChannelChunk: Send + 'static {
+    fn has_audio(&self) -> bool;
+}
+
+impl ChannelChunk for Vec<f32> {
+    fn has_audio(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+impl ChannelChunk for AudioPair {
+    fn has_audio(&self) -> bool {
+        !self.0.is_empty() || !self.1.is_empty()
+    }
+}
+
+pub(super) struct OpenedChannel<T = Vec<f32>> {
+    pub stream: Pin<Box<dyn Stream<Item = Result<T, anlg_resampler::Error>> + Send>>,
     pub device: Option<String>,
 }
 
-pub(super) enum ChannelItem {
+pub(super) enum ChannelItem<T = Vec<f32>> {
     Ready(CaptureChannel, Option<String>),
     Failed(CaptureChannel, Error),
-    Chunk(CaptureChannel, Vec<f32>),
+    Chunk(CaptureChannel, T),
 }
 
-pub(super) type OpenChannel =
-    Arc<dyn Fn(Option<String>, &[String]) -> Result<OpenedChannel, Error> + Send + Sync>;
+pub(super) type OpenChannel<T = Vec<f32>> =
+    Arc<dyn Fn(Option<String>, &[String]) -> Result<OpenedChannel<T>, Error> + Send + Sync>;
 
-pub(super) async fn run_channel(
+pub(super) async fn run_channel<T: ChannelChunk>(
     channel: CaptureChannel,
-    open: OpenChannel,
+    open: OpenChannel<T>,
     mut device: Option<String>,
     mut retry_rx: mpsc::UnboundedReceiver<(Option<String>, bool)>,
-    tx: mpsc::Sender<ChannelItem>,
+    tx: mpsc::Sender<ChannelItem<T>>,
     cancel: CancellationToken,
 ) {
     let mut failures = 0;
@@ -126,7 +145,7 @@ pub(super) async fn run_channel(
                         item = tokio::time::timeout_at(last_frame + FRAME_TIMEOUT, opened.stream.next()) => item,
                     };
                     match item {
-                        Ok(Some(Ok(data))) if !data.is_empty() => {
+                        Ok(Some(Ok(data))) if data.has_audio() => {
                             last_frame = tokio::time::Instant::now();
                             let started = match healthy_since {
                                 Some(started) => started,
@@ -168,13 +187,19 @@ pub(super) async fn run_channel(
             }
             Err(error) => error,
         };
+        // A receiver switched to mono stays mono, so retrying on a timer cannot help.
+        let transient = !matches!(error, Error::MicNotStereo);
         if !startup_reported && tx.send(ChannelItem::Failed(channel, error)).await.is_err() {
             return;
         }
         if manual_retry {
             continue;
         }
-        let delay = RETRY_DELAYS.get(failures).copied();
+        let delay = if transient {
+            RETRY_DELAYS.get(failures).copied()
+        } else {
+            None
+        };
         failures += 1;
         if let Some(delay) = delay {
             tokio::select! {
@@ -282,6 +307,53 @@ mod tests {
             rx.recv().await,
             Some(ChannelItem::Chunk(CaptureChannel::Mic, _))
         ));
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_mono_reopen_is_reported_once_and_only_a_manual_retry_tries_again() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let open: OpenChannel = Arc::new(move |_, _| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Err(Error::MicNotStereo)
+        });
+        let (retry, retry_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_channel(
+            CaptureChannel::Mic,
+            open,
+            None,
+            retry_rx,
+            tx,
+            cancel.clone(),
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(ChannelItem::Failed(
+                CaptureChannel::Mic,
+                Error::MicNotStereo
+            ))
+        ));
+        // The first automatic retry would come after one second.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        retry.send((None, false)).unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(ChannelItem::Failed(
+                CaptureChannel::Mic,
+                Error::MicNotStereo
+            ))
+        ));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
         cancel.cancel();
         task.await.unwrap();
     }

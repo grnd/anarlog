@@ -88,6 +88,15 @@ impl AudioProvider for ActualAudio {
         capture::open_mic_capture(device, sample_rate, chunk_size)
     }
 
+    fn open_split_mic_capture(
+        &self,
+        device: Option<String>,
+        sample_rate: u32,
+        chunk_size: usize,
+    ) -> Result<CaptureStream, Error> {
+        capture::open_split_mic_capture(device, sample_rate, chunk_size)
+    }
+
     fn default_device_name(&self) -> String {
         MicInput::default_device_name()
     }
@@ -110,6 +119,26 @@ impl AudioProvider for ActualAudio {
         Ok(())
     }
 
+    fn probe_mic_stereo(&self, device: Option<String>) -> Result<(), Error> {
+        // A hung startup holds the host lock that opening a device needs; don't wait on it.
+        if mic::startup_pending() {
+            return Err(Error::MicStreamInitializationFailed(
+                "previous microphone startup is still pending".into(),
+            ));
+        }
+        let input = MicInput::probe(device.clone())?;
+        // `MicInput::probe` falls back to another input when the requested one is absent.
+        if !requested_device_opened(device.as_deref(), &input.device_name()) {
+            return Err(Error::MicStreamInitializationFailed(
+                "selected microphone not found".into(),
+            ));
+        }
+        if input.channels() < 2 {
+            return Err(Error::MicNotStereo);
+        }
+        Ok(())
+    }
+
     fn probe_speaker(&self) -> Result<(), Error> {
         let speaker = SpeakerInput::new()
             .map_err(|error| Error::SpeakerStreamInitializationFailed(error.to_string()))?;
@@ -128,5 +157,27 @@ impl AudioProvider for ActualAudio {
         } else {
             None
         }
+    }
+}
+
+/// True when no device was requested, or the opened input is the requested one.
+pub(crate) fn requested_device_opened(requested: Option<&str>, opened: &str) -> bool {
+    // An empty name means the default input, as in `MicInput::new`.
+    requested.map(str::trim).is_none_or(|requested| {
+        requested.is_empty() || requested.eq_ignore_ascii_case(opened.trim())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fallback_input_does_not_stand_in_for_the_requested_device() {
+        assert!(requested_device_opened(None, "MacBook Mic"));
+        assert!(requested_device_opened(Some("Receiver"), "Receiver"));
+        assert!(!requested_device_opened(Some("Receiver"), "MacBook Mic"));
+        assert!(requested_device_opened(Some(""), "MacBook Mic"));
+        assert!(requested_device_opened(Some(" receiver "), "Receiver"));
     }
 }
