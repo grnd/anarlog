@@ -2,6 +2,7 @@ import { t } from "@lingui/core/macro";
 import { Trans } from "@lingui/react/macro";
 import { useForm } from "@tanstack/react-form";
 import { useQuery } from "@tanstack/react-query";
+import { useRef } from "react";
 
 import { commands as analyticsCommands } from "@anlg/plugin-analytics";
 import { commands as listenerCommands } from "@anlg/plugin-transcription";
@@ -33,6 +34,7 @@ import {
 import { SettingSwitchRow } from "~/settings/setting-row";
 import { isAppStoreBuild } from "~/shared/app-store";
 import { resolveConfigValue, resolveConfigValues } from "~/shared/config";
+import { resolveSelectedMicrophoneName } from "~/stt/selected-microphone";
 
 const SETTINGS_FORM_KEYS = [
   "autostart",
@@ -197,6 +199,13 @@ function SettingsSectionContent({
     "microphone_device",
     storedSettings,
   );
+  const splitStereoMic =
+    resolveConfigValue("microphone_split_stereo", storedSettings) === true;
+  const splitStereoMicDevice = resolveConfigValue(
+    "microphone_split_stereo_device",
+    storedSettings,
+  );
+  const splitToggleRequest = useRef(0);
   const microphoneDevicesQuery = useQuery({
     queryKey: ["microphone-devices"],
     queryFn: async () => {
@@ -374,8 +383,29 @@ function SettingsSectionContent({
               microphoneDevice={{
                 value: microphoneDevice,
                 devices: microphoneDevicesQuery.data ?? [],
-                onChange: (value) =>
-                  setSettingValues({ microphone_device: value }),
+                onChange: (value) => {
+                  splitToggleRequest.current += 1;
+                  setSettingValues({ microphone_device: value });
+                },
+              }}
+              splitStereoMic={{
+                value: splitStereoMic,
+                device: splitStereoMicDevice,
+                onChange: async (value) => {
+                  // Tie the switch to the mic selected now, so a call on
+                  // another mic records normally.
+                  const request = ++splitToggleRequest.current;
+                  const device = value
+                    ? await resolveSelectedMicrophoneName(microphoneDevice)
+                    : "";
+                  // A newer toggle won the race; saving this one would leave
+                  // a device stored with the switch off, or the reverse.
+                  if (request !== splitToggleRequest.current) return;
+                  setSettingValues({
+                    microphone_split_stereo: value,
+                    microphone_split_stereo_device: device,
+                  });
+                },
               }}
               rememberSpeakers={{
                 value: rememberSpeakers,

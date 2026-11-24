@@ -38,6 +38,7 @@ import {
   normalizeStoredSttModel,
   normalizeStoredSttSelection,
 } from "~/stt/model-selection";
+import { resolveSelectedMicrophoneName } from "~/stt/selected-microphone";
 
 type AppSettingRow = { id: string; value_json: string };
 
@@ -158,6 +159,21 @@ export async function initializeApplicationSettings(): Promise<void> {
   const migratedAutoPrompt = await migrateLegacyAutoSummaryPrompt(stored);
   if (migratedAutoPrompt !== null) {
     updates.auto_summary_prompt = migratedAutoPrompt;
+  }
+
+  // The switch used to apply to every mic. Tie it once to the mic in use, so
+  // the next recording keeps splitting. A failed lookup leaves it empty and
+  // Audio settings asks the user to turn the switch off and on again.
+  if (
+    stored.values.microphone_split_stereo === true &&
+    !stored.values.microphone_split_stereo_device
+  ) {
+    const device = await resolveSelectedMicrophoneName(
+      stored.values.microphone_device,
+    );
+    if (device) {
+      updates.microphone_split_stereo_device = device;
+    }
   }
 
   if (Object.keys(updates).length > 0) {

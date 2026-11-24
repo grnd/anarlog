@@ -51,6 +51,8 @@ vi.mock("~/session-sharing", () => ({
   ),
 }));
 
+vi.mock("./split-mic-badge", () => ({ SplitMicBadge: () => null }));
+
 vi.mock("../shared", () => ({
   RecordingIcon: () => <div />,
   useHasTranscript: (sessionId: string) =>

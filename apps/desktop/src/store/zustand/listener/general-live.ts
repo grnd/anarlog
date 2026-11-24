@@ -1012,6 +1012,9 @@ function applyCaptureSnapshot<T extends LiveStore>(
       if (snapshot.micMuted != null) {
         live.muted = snapshot.micMuted;
       }
+      if (snapshot.splitStereoMic != null) {
+        live.splitStereoMic = snapshot.splitStereoMic;
+      }
     });
     notifyCaptureWarning(get, targetSessionId);
     return;

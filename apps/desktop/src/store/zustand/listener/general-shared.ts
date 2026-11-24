@@ -52,6 +52,7 @@ export type GeneralState = {
     lastErrorSessionId: string | null;
     lastErrorIsAudioRelated: boolean;
     device: string | null;
+    splitStereoMic: boolean;
     degraded: DegradedError | null;
     requestedLiveTranscription: boolean | null;
     liveTranscriptionActive: boolean | null;
@@ -87,6 +88,7 @@ const initialLiveState: LiveState = {
   lastErrorSessionId: null,
   lastErrorIsAudioRelated: false,
   device: null,
+  splitStereoMic: false,
   degraded: null,
   requestedLiveTranscription: null,
   liveTranscriptionActive: null,
@@ -265,6 +267,7 @@ export const markLiveInactive = (
   live.lastErrorSessionId = error === null ? null : sessionId;
   live.lastErrorIsAudioRelated = isAudioRelated;
   live.device = null;
+  live.splitStereoMic = false;
   live.degraded = null;
   live.requestedLiveTranscription = null;
   live.liveTranscriptionActive = null;
@@ -300,6 +303,7 @@ export const markLiveStartFailed = (
   live.lastErrorSessionId = sessionId;
   live.lastErrorIsAudioRelated = audioError !== null;
   live.device = null;
+  live.splitStereoMic = false;
   live.degraded = null;
   live.requestedLiveTranscription = null;
   live.liveTranscriptionActive = null;

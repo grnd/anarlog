@@ -19,6 +19,7 @@ export function AudioSettingsView({
   audioRetention,
   microphoneDevice,
   rememberSpeakers,
+  splitStereoMic,
 }: {
   audioRetention: {
     value: string;
@@ -33,6 +34,12 @@ export function AudioSettingsView({
     value: boolean;
     onChange: (value: boolean) => void;
   };
+  splitStereoMic: {
+    value: boolean;
+    // The microphone the switch was turned on for; empty when unknown.
+    device?: string;
+    onChange: (value: boolean) => void;
+  };
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -44,6 +51,31 @@ export function AudioSettingsView({
         value={microphoneDevice.value}
         devices={microphoneDevice.devices}
         onChange={microphoneDevice.onChange}
+      />
+      <SettingSwitchRow
+        title={<Trans>Split stereo microphone into two speakers</Trans>}
+        description={
+          <>
+            <Trans>
+              Transcribe the left channel as one speaker and the right channel
+              as another, for a two-transmitter wireless mic in stereo mode.
+              System audio is not recorded while this is on.
+            </Trans>
+            {splitStereoMic.value ? (
+              <span className="mt-1 block">
+                {splitStereoMic.device ? (
+                  <Trans>Applies to: {splitStereoMic.device}</Trans>
+                ) : (
+                  <Trans>
+                    Turn this off and on again to choose the microphone.
+                  </Trans>
+                )}
+              </span>
+            ) : null}
+          </>
+        }
+        checked={splitStereoMic.value}
+        onChange={splitStereoMic.onChange}
       />
       <AudioRetentionRow
         value={audioRetention.value}

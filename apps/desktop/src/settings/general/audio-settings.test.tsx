@@ -13,12 +13,17 @@ function renderAudioSettings({
     value: false,
     onChange: vi.fn(),
   },
+  splitStereoMic = {
+    value: false,
+    onChange: vi.fn(),
+  } as { value: boolean; device?: string; onChange: (value: boolean) => void },
 } = {}) {
   return render(
     <AudioSettingsView
       audioRetention={{ value: "forever", onChange: vi.fn() }}
       microphoneDevice={microphoneDevice}
       rememberSpeakers={rememberSpeakers}
+      splitStereoMic={splitStereoMic}
     />,
   );
 }
@@ -56,5 +61,53 @@ describe("AudioSettingsView", () => {
 
     toggle.click();
     expect(onChange).toHaveBeenCalledWith(nextValue);
+  });
+
+  it("toggles split stereo microphone on", () => {
+    const onChange = vi.fn();
+    renderAudioSettings({
+      splitStereoMic: { value: false, onChange },
+    });
+
+    screen
+      .getByRole("switch", {
+        name: "Split stereo microphone into two speakers",
+      })
+      .click();
+    expect(onChange).toHaveBeenCalledWith(true);
+  });
+
+  it("shows which microphone the split applies to", () => {
+    renderAudioSettings({
+      splitStereoMic: {
+        value: true,
+        device: "DJI MIC MINI",
+        onChange: vi.fn(),
+      },
+    });
+
+    expect(screen.getByText("Applies to: DJI MIC MINI")).toBeTruthy();
+  });
+
+  it("hides the microphone line when the split is off", () => {
+    renderAudioSettings({
+      splitStereoMic: {
+        value: false,
+        device: "DJI MIC MINI",
+        onChange: vi.fn(),
+      },
+    });
+
+    expect(screen.queryByText(/Applies to/)).toBeNull();
+  });
+
+  it("asks to toggle again when the split has no stored microphone", () => {
+    renderAudioSettings({
+      splitStereoMic: { value: true, device: "", onChange: vi.fn() },
+    });
+
+    expect(
+      screen.getByText("Turn this off and on again to choose the microphone."),
+    ).toBeTruthy();
   });
 });

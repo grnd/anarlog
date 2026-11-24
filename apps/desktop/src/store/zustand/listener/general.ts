@@ -110,6 +110,7 @@ export const createGeneralSlice = <
 
       setLiveState(set, (live) => {
         markLiveStartRequested(live, targetSessionId);
+        live.splitStereoMic = params.split_stereo_mic === true;
       });
 
       if (options?.handlePersist) {

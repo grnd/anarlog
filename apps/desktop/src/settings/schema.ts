@@ -220,6 +220,16 @@ export const SETTING_DEFINITIONS = {
     path: ["general", "microphone_device"],
     default: "" as string,
   },
+  microphone_split_stereo: {
+    type: "boolean",
+    path: ["general", "microphone_split_stereo"],
+    default: false as boolean,
+  },
+  microphone_split_stereo_device: {
+    type: "string",
+    path: ["general", "microphone_split_stereo_device"],
+    default: "" as string,
+  },
   notification_disabled: {
     type: "boolean",
     path: ["notification", "disabled"],

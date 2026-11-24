@@ -16,6 +16,7 @@ import { FolderPicker } from "../folder-picker";
 import { RecordingIcon, useHasTranscript } from "../shared";
 import { TitleInput } from "../title-input";
 import { OverflowButton } from "./overflow";
+import { SplitMicBadge } from "./split-mic-badge";
 
 import { useAudioPlayer } from "~/audio-player";
 import { useNow } from "~/calendar/hooks";
@@ -119,6 +120,7 @@ export function OuterHeader({
         className="relative z-10 flex shrink-0 items-center pr-1"
       >
         {!showTitleInput && <FolderPicker sessionId={sessionId} align="end" />}
+        <SplitMicBadge sessionId={sessionId} />
         <HeaderMeetingControl
           sessionId={sessionId}
           sessionMode={sessionMode}

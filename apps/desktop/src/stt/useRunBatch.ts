@@ -53,6 +53,9 @@ type RunOptions = {
     persist: (words: WordWithId[], hints: SpeakerHintWithId[]) => Promise<void>;
   };
   deferAudioFinalization?: boolean;
+  // Only for a file recorded entirely in split mode, such as a capture chunk.
+  // Whole-session audio carries its own split-layout.json.
+  splitStereoMic?: boolean;
   handlePersist?: BatchPersistCallback;
   notifyOnCompletion?: boolean;
   resume?: { provider: BatchProvider; model: string };
@@ -552,6 +555,7 @@ export const useRunBatch = (sessionId: string) => {
               options?.promotion?.scope === "whole_session"
                 ? serializeBatchResumeContext({ promotion: "whole_session" })
                 : null,
+            split_stereo_mic: options?.splitStereoMic === true,
           };
 
           const run = async (params: TranscriptionParams) => {

@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   setSessionReplayAnalyticsEnabled: vi.fn(),
   setAutomaticUpdatesEnabled: vi.fn(async () => undefined),
   setProperties: vi.fn(async () => undefined),
+  resolveMic: vi.fn(async (_device: unknown): Promise<string> => ""),
   executeTransaction: vi.fn(
     (_statements: Array<{ sql: string; params: unknown[] }>) =>
       Promise.resolve([1]),
@@ -43,6 +44,10 @@ vi.mock("@anlg/plugin-updater2", () => ({
   commands: {
     setAutomaticUpdatesEnabled: mocks.setAutomaticUpdatesEnabled,
   },
+}));
+
+vi.mock("~/stt/selected-microphone", () => ({
+  resolveSelectedMicrophoneName: mocks.resolveMic,
 }));
 
 vi.mock("~/db", () => ({
@@ -368,6 +373,64 @@ describe("SQLite settings", () => {
         ],
       }),
     );
+  });
+
+  it("fills the split stereo device once from the selected microphone", async () => {
+    mocks.resolveMic.mockResolvedValue("DJI MIC");
+    mocks.execute.mockResolvedValue([
+      { id: "microphone_split_stereo", value_json: "true" },
+      { id: "microphone_device", value_json: JSON.stringify("DJI MIC") },
+    ]);
+
+    await initializeApplicationSettings();
+
+    expect(mocks.resolveMic).toHaveBeenCalledWith("DJI MIC");
+    expect(mocks.executeTransaction.mock.calls[0][0]).toContainEqual(
+      expect.objectContaining({
+        params: [
+          "microphone_split_stereo_device",
+          JSON.stringify("DJI MIC"),
+          expect.any(String),
+        ],
+      }),
+    );
+  });
+
+  it("keeps a stored split stereo device", async () => {
+    mocks.resolveMic.mockResolvedValue("Other");
+    mocks.execute.mockResolvedValue([
+      { id: "microphone_split_stereo", value_json: "true" },
+      {
+        id: "microphone_split_stereo_device",
+        value_json: JSON.stringify("DJI MIC"),
+      },
+    ]);
+
+    await initializeApplicationSettings();
+
+    expect(mocks.resolveMic).not.toHaveBeenCalled();
+    const calls = mocks.executeTransaction.mock.calls.flatMap(
+      (call) => call[0],
+    );
+    expect(
+      calls.some((s) => s.params[0] === "microphone_split_stereo_device"),
+    ).toBe(false);
+  });
+
+  it("leaves the split stereo device empty when the lookup fails", async () => {
+    mocks.resolveMic.mockResolvedValue("");
+    mocks.execute.mockResolvedValue([
+      { id: "microphone_split_stereo", value_json: "true" },
+    ]);
+
+    await initializeApplicationSettings();
+
+    const calls = mocks.executeTransaction.mock.calls.flatMap(
+      (call) => call[0],
+    );
+    expect(
+      calls.some((s) => s.params[0] === "microphone_split_stereo_device"),
+    ).toBe(false);
   });
 
   it("initializes languages from OS preferences", async () => {

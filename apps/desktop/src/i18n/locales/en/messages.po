@@ -764,6 +764,11 @@ msgstr "Apple Calendar access is off"
 msgid "Application menu"
 msgstr "Application menu"
 
+#. placeholder {0}: splitStereoMic.device
+#: src/settings/general/audio-settings.tsx
+msgid "Applies to: {0}"
+msgstr "Applies to: {0}"
+
 #: src/session/components/note-input/transcript/renderer/speaker-assign.tsx
 msgid "Apply to all"
 msgstr "Apply to all"
@@ -3444,6 +3449,10 @@ msgstr "Leave workspace"
 msgid "Leaving gives up your access to shared notes here."
 msgstr "Leaving gives up your access to shared notes here."
 
+#: src/session/components/outer-header/split-mic-badge.tsx
+msgid "Left and right channels are two speakers. System audio is not recorded."
+msgstr "Left and right channels are two speakers. System audio is not recorded."
+
 #: src/settings/stats/index.tsx
 msgid "Less"
 msgstr "Less"
@@ -6030,6 +6039,14 @@ msgstr "Sparkle"
 msgid "Speak into the focused text field in your apps. Your transcript appears when you finish."
 msgstr "Speak into the focused text field in your apps. Your transcript appears when you finish."
 
+#: src/session/components/outer-header/split-mic-badge.tsx
+msgid "Split mic"
+msgstr "Split mic"
+
+#: src/settings/general/audio-settings.tsx
+msgid "Split stereo microphone into two speakers"
+msgstr "Split stereo microphone into two speakers"
+
 #: src/settings/general/storage/legacy-cleanup.tsx
 msgid "SQLite migration verification is incomplete"
 msgstr "SQLite migration verification is incomplete"
@@ -6555,6 +6572,10 @@ msgstr "Tomorrow"
 msgid "Transcribe"
 msgstr "Transcribe"
 
+#: src/settings/general/audio-settings.tsx
+msgid "Transcribe the left channel as one speaker and the right channel as another, for a two-transmitter wireless mic in stereo mode. System audio is not recorded while this is on."
+msgstr "Transcribe the left channel as one speaker and the right channel as another, for a two-transmitter wireless mic in stereo mode. System audio is not recorded while this is on."
+
 #: src/chat/components/input/index.tsx
 msgid "Transcribing voice input"
 msgstr "Transcribing voice input"
@@ -6647,6 +6668,10 @@ msgstr "Turn on Anarlog Camera in System Settings under Privacy & Security, Came
 #: src/calendar/components/apple/permission.tsx
 msgid "Turn on Anarlog in System Settings → Privacy & Security → Calendars, then return here."
 msgstr "Turn on Anarlog in System Settings → Privacy & Security → Calendars, then return here."
+
+#: src/settings/general/audio-settings.tsx
+msgid "Turn this off and on again to choose the microphone."
+msgstr "Turn this off and on again to choose the microphone."
 
 #: src/settings/dictation-engine.tsx
 msgid "Turns down your speakers while you speak, then restores the level it changed."

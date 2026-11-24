@@ -764,6 +764,11 @@ msgstr ""
 msgid "Application menu"
 msgstr ""
 
+#. placeholder {0}: splitStereoMic.device
+#: src/settings/general/audio-settings.tsx
+msgid "Applies to: {0}"
+msgstr ""
+
 #: src/session/components/note-input/transcript/renderer/speaker-assign.tsx
 msgid "Apply to all"
 msgstr ""
@@ -3444,6 +3449,10 @@ msgstr ""
 msgid "Leaving gives up your access to shared notes here."
 msgstr ""
 
+#: src/session/components/outer-header/split-mic-badge.tsx
+msgid "Left and right channels are two speakers. System audio is not recorded."
+msgstr ""
+
 #: src/settings/stats/index.tsx
 msgid "Less"
 msgstr ""
@@ -6030,6 +6039,14 @@ msgstr ""
 msgid "Speak into the focused text field in your apps. Your transcript appears when you finish."
 msgstr "Dicta en el campo de texto activo de tus aplicaciones. La transcripción aparece cuando terminas."
 
+#: src/session/components/outer-header/split-mic-badge.tsx
+msgid "Split mic"
+msgstr ""
+
+#: src/settings/general/audio-settings.tsx
+msgid "Split stereo microphone into two speakers"
+msgstr ""
+
 #: src/settings/general/storage/legacy-cleanup.tsx
 msgid "SQLite migration verification is incomplete"
 msgstr ""
@@ -6555,6 +6572,10 @@ msgstr ""
 msgid "Transcribe"
 msgstr ""
 
+#: src/settings/general/audio-settings.tsx
+msgid "Transcribe the left channel as one speaker and the right channel as another, for a two-transmitter wireless mic in stereo mode. System audio is not recorded while this is on."
+msgstr ""
+
 #: src/chat/components/input/index.tsx
 msgid "Transcribing voice input"
 msgstr ""
@@ -6646,6 +6667,10 @@ msgstr ""
 
 #: src/calendar/components/apple/permission.tsx
 msgid "Turn on Anarlog in System Settings → Privacy & Security → Calendars, then return here."
+msgstr ""
+
+#: src/settings/general/audio-settings.tsx
+msgid "Turn this off and on again to choose the microphone."
 msgstr ""
 
 #: src/settings/dictation-engine.tsx

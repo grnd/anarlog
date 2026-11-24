@@ -13,6 +13,12 @@ const mocks = vi.hoisted(() => ({
   mutateCloudSync: vi.fn(),
   setSettingValues: vi.fn(),
   meetingSettingsProps: vi.fn(),
+  audioSettingsProps: vi.fn(),
+  resolveMic: vi.fn(),
+}));
+
+vi.mock("~/stt/selected-microphone", () => ({
+  resolveSelectedMicrophoneName: mocks.resolveMic,
 }));
 
 vi.mock("@anlg/plugin-analytics", () => ({
@@ -55,7 +61,10 @@ vi.mock("./camera-watermark", () => ({
   CameraWatermarkSettings: () => null,
 }));
 vi.mock("./audio-settings", () => ({
-  AudioSettingsView: () => <span>Audio settings</span>,
+  AudioSettingsView: (props: unknown) => {
+    mocks.audioSettingsProps(props);
+    return <span>Audio settings</span>;
+  },
 }));
 vi.mock("./main-language", () => ({
   MainLanguageView: ({ value }: { value: string }) => (
@@ -111,6 +120,44 @@ describe("SettingsApp", () => {
     render(<SettingsApp />);
 
     expect(screen.getByTestId("main-language").textContent).toBe("ko");
+  });
+
+  it("ignores a stale split stereo toggle that finishes late", async () => {
+    mocks.useStoredSettingValuesQuery.mockReturnValue({
+      data: { values: {}, hasValues: new Set() },
+      isLoading: false,
+      error: null,
+    });
+    let release = (_name: string) => {};
+    mocks.resolveMic.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        release = resolve;
+      }),
+    );
+    mocks.setSettingValues.mockClear();
+
+    render(<SettingsMeetings />);
+
+    const props = mocks.audioSettingsProps.mock.lastCall?.[0] as {
+      splitStereoMic: { onChange: (value: boolean) => Promise<void> };
+    };
+    let on: Promise<void> = Promise.resolve();
+    act(() => {
+      on = props.splitStereoMic.onChange(true);
+    });
+    await act(async () => {
+      await props.splitStereoMic.onChange(false);
+    });
+    await act(async () => {
+      release("DJI MIC");
+      await on;
+    });
+
+    expect(mocks.setSettingValues).toHaveBeenCalledTimes(1);
+    expect(mocks.setSettingValues).toHaveBeenCalledWith({
+      microphone_split_stereo: false,
+      microphone_split_stereo_device: "",
+    });
   });
 
   it("persists meeting switch toggles", async () => {

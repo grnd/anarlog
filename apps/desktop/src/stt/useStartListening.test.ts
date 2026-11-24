@@ -249,6 +249,12 @@ vi.mock("~/ai/task-window-sync", () => ({
   requestMainAutoEnhance: requestMainAutoEnhanceMock,
 }));
 
+vi.mock("./selected-microphone", () => ({
+  resolveSelectedMicrophoneName: vi.fn(
+    async (device: string) => device || "Default Mic",
+  ),
+}));
+
 vi.mock("./primary-device", () => ({
   consumePrimaryDeviceYield: () => false,
   startPrimaryDeviceCoordination: vi.fn(),
@@ -1598,6 +1604,214 @@ describe("useStartListening", () => {
       expect(endCloudsyncActivityMock).toHaveBeenCalled();
     },
   );
+
+  const configWith = (values: Record<string, unknown>) =>
+    useConfigValueMock.mockImplementation((key) =>
+      key in values
+        ? values[key]
+        : key === "ai_language"
+          ? "en"
+          : key === "consent_auto_send_chat" || key === "capture_meeting_chat"
+            ? false
+            : [],
+    );
+
+  test.each([
+    {
+      name: "the stored mic is the system default",
+      stored: "Default Mic",
+      mic: "",
+      split: true,
+    },
+    {
+      name: "the stored mic is selected explicitly",
+      stored: "DJI",
+      mic: "DJI",
+      split: true,
+    },
+    {
+      name: "another mic is selected",
+      stored: "DJI",
+      mic: "Studio Mic",
+      split: false,
+    },
+    {
+      name: "the system default is another mic",
+      stored: "DJI",
+      mic: "",
+      split: false,
+    },
+  ])(
+    "splits only when the recording mic matches: $name",
+    async ({ stored, mic, split }) => {
+      configWith({
+        microphone_split_stereo: true,
+        microphone_split_stereo_device: stored,
+        microphone_device: mic,
+      });
+      const { result } = renderHook(() => useStartListening("session-1"));
+
+      await act(async () => {
+        await result.current();
+      });
+
+      expect(startMock.mock.calls[0]?.[0].split_stereo_mic).toBe(split);
+    },
+  );
+
+  test("does not split when no mic is stored for the switch", async () => {
+    configWith({
+      microphone_split_stereo: true,
+      microphone_split_stereo_device: "",
+      microphone_device: "",
+    });
+    const { result } = renderHook(() => useStartListening("session-1"));
+
+    await act(async () => {
+      await result.current();
+    });
+
+    expect(startMock.mock.calls[0]?.[0].split_stereo_mic).toBe(false);
+  });
+
+  test("does not split when the switch is off", async () => {
+    configWith({
+      microphone_split_stereo: false,
+      microphone_split_stereo_device: "Default Mic",
+      microphone_device: "",
+    });
+    const { result } = renderHook(() => useStartListening("session-1"));
+
+    await act(async () => {
+      await result.current();
+    });
+
+    expect(startMock.mock.calls[0]?.[0].split_stereo_mic).toBe(false);
+  });
+
+  test("passes no split flag to the whole-session run of a split capture", async () => {
+    configWith({
+      microphone_split_stereo: true,
+      microphone_split_stereo_device: "Default Mic",
+      microphone_device: "",
+    });
+    const { result } = renderHook(() => useStartListening("session-1"));
+
+    await act(async () => {
+      await result.current();
+    });
+    await act(async () => {
+      await startMock.mock.calls[0]?.[1].onStopped("session-1", {
+        durationSeconds: 42,
+        audioPath: "/tmp/session.wav",
+        requestedLiveTranscription: false,
+        liveTranscriptionActive: false,
+        needsBatchRepair: false,
+      });
+    });
+
+    expect(saveCaptureLifecycleMarkerMock).toHaveBeenCalledWith(
+      expect.objectContaining({ splitStereoMic: true }),
+    );
+    expect(runBatchMock).toHaveBeenCalledWith(
+      "/tmp/session.wav",
+      expect.objectContaining({ promotion: { scope: "whole_session" } }),
+    );
+    expect(runBatchMock.mock.calls[0]?.[1]).not.toHaveProperty(
+      "splitStereoMic",
+    );
+  });
+
+  test("passes the split flag to the chunk recovery run of a split capture", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const capturedAt = new Date("2026-07-24T00:00:00.000Z").getTime();
+    vi.setSystemTime(capturedAt);
+    configWith({
+      microphone_split_stereo: true,
+      microphone_split_stereo_device: "Default Mic",
+      microphone_device: "",
+    });
+    vi.mocked(transcriptionCommands.listCaptureAudioChunks).mockResolvedValue({
+      status: "ok",
+      data: [
+        {
+          id: "chunk-1",
+          path: "/tmp/chunk-1.ogg",
+          capture_started_at: capturedAt,
+          start_ms: 0,
+          audio_start_ms: 0,
+          end_ms: 60_000,
+        },
+      ],
+    });
+    const { result } = renderHook(() => useStartListening("session-1"));
+    await act(async () => {
+      await result.current();
+    });
+    vi.setSystemTime(capturedAt + 120_000);
+    const lifecycle = vi.mocked(
+      transcriptionEvents.captureLifecycleEvent.listen,
+    ).mock.calls[0]?.[0];
+    lifecycle?.({
+      payload: {
+        type: "started",
+        session_id: "session-1",
+        requested_live_transcription: false,
+        live_transcription_active: false,
+      },
+    } as never);
+    await act(async () => {
+      await startMock.mock.calls[0]?.[1].onStopped("session-1", {
+        chunkedAudio: true,
+        durationSeconds: 120,
+        audioPath: null,
+        requestedLiveTranscription: false,
+        liveTranscriptionActive: false,
+        needsBatchRepair: false,
+      });
+    });
+
+    expect(runBatchMock).toHaveBeenCalledWith(
+      "/tmp/chunk-1.ogg",
+      expect.objectContaining({ splitStereoMic: true }),
+    );
+  });
+
+  test("passes no split flag to the whole-session run of a recovered split capture", async () => {
+    loadCaptureLifecycleMarkerMock.mockResolvedValue({
+      version: 1,
+      sessionId: "session-1",
+      transcriptId: "transcript-before-reload",
+      startedAt: 1_000,
+      createdAt: "2026-07-24T00:00:00.000Z",
+      audioOffsetMs: 0,
+      preserveExistingTranscript: false,
+      ownerUserId: "user-1",
+      memo: "",
+      splitStereoMic: true,
+    });
+    const { result } = renderHook(() =>
+      useResumeListeningLifecycle("session-1"),
+    );
+
+    await act(async () => {
+      await result.current({ processStopped: true });
+    });
+    const onStopped = attachLiveSessionMock.mock.calls[0]?.[1]?.onStopped;
+    await act(async () => {
+      await onStopped?.("session-1", {
+        durationSeconds: 42,
+        audioPath: "/tmp/session.wav",
+        requestedLiveTranscription: false,
+        liveTranscriptionActive: false,
+        needsBatchRepair: false,
+      });
+    });
+
+    expect(runBatchMock.mock.calls[0]?.[1]).not.toHaveProperty(
+      "splitStereoMic",
+    );
+  });
 
   test("does not treat a capture with a committed native transcript as empty", async () => {
     useSessionMock.mockReturnValue({

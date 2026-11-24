@@ -239,6 +239,8 @@ export function useCaptureLifecycle(sessionId: string) {
       recoveredMarker?: CaptureLifecycleMarker,
       startedAutomatically = false,
       pendingMarker?: CaptureLifecycleMarker,
+      // The split mode sent to the native capture this lifecycle starts.
+      startedSplitStereoMic = false,
     ) => {
       const inheritedCaptures: InheritedCapture[] =
         recoveredMarker?.inheritedCaptures ??
@@ -258,6 +260,9 @@ export function useCaptureLifecycle(sessionId: string) {
                   ? { provider: pendingMarker.provider }
                   : {}),
                 ...(pendingMarker.model ? { model: pendingMarker.model } : {}),
+                ...(pendingMarker.splitStereoMic
+                  ? { splitStereoMic: true }
+                  : {}),
               },
             ]
           : []);
@@ -297,6 +302,9 @@ export function useCaptureLifecycle(sessionId: string) {
       const ownerUserId =
         recoveredMarker?.ownerUserId ?? session?.user_id ?? "";
       const provider = recoveredMarker?.provider ?? conn?.provider;
+      const splitStereoMic = recoveredMarker
+        ? recoveredMarker.splitStereoMic === true
+        : startedSplitStereoMic;
       const model = recoveredMarker?.model ?? conn?.model;
       const retainAudio =
         recoveredMarker?.retainAudio ??
@@ -537,6 +545,9 @@ export function useCaptureLifecycle(sessionId: string) {
             await runBatchRef.current(chunk.path, {
               signal,
               deferAudioFinalization: true,
+              ...((inherited ? inherited.splitStereoMic : splitStereoMic)
+                ? { splitStereoMic: true }
+                : {}),
               notifyOnCompletion: false,
               recovery: {
                 persist: async (words, hints) => {
@@ -750,6 +761,7 @@ export function useCaptureLifecycle(sessionId: string) {
         memo: memoMd,
         ...(provider ? { provider } : {}),
         ...(model ? { model } : {}),
+        ...(splitStereoMic ? { splitStereoMic: true } : {}),
         ...(pendingSummaryMode ? { summaryMode: pendingSummaryMode } : {}),
         ...(refreshSummaryAfterRepair
           ? { refreshSummaryAfterRepair: true }
@@ -1000,6 +1012,10 @@ export function useCaptureLifecycle(sessionId: string) {
               finalAudioDurationMs + 1_000 >= existingAudioDurationMs
                 ? Math.min(existingAudioDurationMs, finalAudioDurationMs)
                 : 0;
+            const currentCaptureOnly =
+              preserveExistingTranscript || transcriptCreated;
+            // The batch reads split-layout.json next to the session audio, so a
+            // whole-session run needs no split flag from here.
             await runBatchRef.current(details.audioPath!, {
               deferAudioFinalization: true,
               ...(stoppedAtMs !== null
@@ -1014,17 +1030,16 @@ export function useCaptureLifecycle(sessionId: string) {
                     apiKey: "",
                   }
                 : {}),
-              promotion:
-                preserveExistingTranscript || transcriptCreated
-                  ? {
-                      scope: "current_capture",
-                      audioOffsetMs,
-                      ...(transcriptCreated
-                        ? { replaceTranscriptId: transcriptId }
-                        : {}),
-                      startedAt,
-                    }
-                  : { scope: "whole_session" },
+              promotion: currentCaptureOnly
+                ? {
+                    scope: "current_capture",
+                    audioOffsetMs,
+                    ...(transcriptCreated
+                      ? { replaceTranscriptId: transcriptId }
+                      : {}),
+                    startedAt,
+                  }
+                : { scope: "whole_session" },
             });
             batchCompleted = true;
             console.info("[listener] completed post-stop transcript repair", {
