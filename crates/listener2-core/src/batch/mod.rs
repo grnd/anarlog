@@ -1,8 +1,10 @@
 mod accumulator;
+mod bleed;
 mod consolidate;
 mod diarize;
 mod progressive;
 mod simple;
+mod split_sides;
 #[cfg(test)]
 mod test_fixtures;
 mod upload;
@@ -135,6 +137,10 @@ pub struct BatchParams {
     /// provider.
     #[serde(default)]
     pub known_speakers: Vec<KnownSpeaker>,
+    /// The whole input file was recorded with a split stereo mic (a capture chunk).
+    /// The session audio file instead lists its split ranges in `split-layout.json`.
+    #[serde(default)]
+    pub split_stereo_mic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -205,15 +211,23 @@ pub fn expects_progressive_batch(params: &BatchParams) -> bool {
                 languages: params.languages.clone(),
                 ..Default::default()
             };
-
-            supports_progressive_batch(
-                resolve_batch_adapter_kind(params, &listen_params),
-                listen_params.model.as_deref(),
-            )
+            let adapter_kind = resolve_batch_adapter_kind(params, &listen_params);
+            if !supports_progressive_batch(adapter_kind, listen_params.model.as_deref()) {
+                return false;
+            }
+            !(split_sides::is_mixed_channel_adapter(adapter_kind) && has_split_ranges(params))
         }
         BatchProvider::WhisperLocal => true,
         _ => false,
     }
+}
+
+fn has_split_ranges(params: &BatchParams) -> bool {
+    if params.split_stereo_mic {
+        return true;
+    }
+    load_session_split_layout(std::path::Path::new(&params.file_path))
+        .is_some_and(|layout| !layout.ranges.is_empty())
 }
 
 async fn run_batch_inner(
@@ -245,15 +259,18 @@ async fn run_batch_inner(
     };
 
     let listen_params = build_listen_params(&params, metadata.channels, metadata.sample_rate);
+    let (ranges, whole_file) = split_ranges(&params).await;
 
     let post_process = (runtime.clone(), params.clone(), listen_params.clone());
+    let mut sides_split = false;
     let mut output = match params.provider {
         BatchProvider::Am | BatchProvider::OpenAI => {
             let adapter_kind = resolve_batch_adapter_kind(&params, &listen_params);
-            if supports_progressive_batch(adapter_kind, listen_params.model.as_deref()) {
+            if use_progressive_path(adapter_kind, &listen_params, &ranges) {
                 run_progressive_batch_session(runtime, params, listen_params).await
             } else {
-                run_direct_batch_for_adapter_kind(adapter_kind, params, listen_params).await
+                sides_split = will_split_sides(adapter_kind, &listen_params, &ranges);
+                run_direct(adapter_kind, params, listen_params, &ranges, whole_file).await
             }
         }
         BatchProvider::WhisperLocal => {
@@ -269,14 +286,165 @@ async fn run_batch_inner(
             let adapter_kind = provider
                 .to_adapter_kind()
                 .expect("all non-special BatchProvider variants have an AdapterKind mapping");
-            run_direct_batch_for_adapter_kind(adapter_kind, params, listen_params).await
+            sides_split = will_split_sides(adapter_kind, &listen_params, &ranges);
+            run_direct(adapter_kind, params, listen_params, &ranges, whole_file).await
         }
     }?;
 
     let (runtime, params, listen_params) = post_process;
-    apply_local_diarization(runtime.clone(), &params, &listen_params, &mut output).await;
-    consolidate_hosted_speakers(runtime, &params, &listen_params, &mut output).await;
+    if !ranges.is_empty() {
+        drop_bleed(&params.file_path, &mut output.response, &ranges).await;
+    }
+    let all_words_pinned =
+        !ranges.is_empty() && whole_file && (sides_split || !bleed::is_mixdown(&output.response));
+    if !all_words_pinned {
+        apply_local_diarization(runtime.clone(), &params, &listen_params, &mut output).await;
+        consolidate_hosted_speakers(runtime, &params, &listen_params, &mut output).await;
+    }
+    if !ranges.is_empty() {
+        split_sides::pin_split_speakers(&mut output.response, &ranges, sides_split);
+        split_sides::offset_unsplit_speakers(&mut output.response, &ranges, sides_split);
+    }
     Ok(output)
+}
+
+/// Time ranges (ms from the start of the input) recorded in split mode, plus whether those
+/// ranges cover the whole file. Empty means a normal recording, with no split handling.
+async fn split_ranges(params: &BatchParams) -> (Vec<(i64, i64)>, bool) {
+    let path = std::path::PathBuf::from(&params.file_path);
+    let whole = params.split_stereo_mic;
+    tokio::task::spawn_blocking(move || split_ranges_blocking(&path, whole))
+        .await
+        .unwrap_or_default()
+}
+
+fn load_session_split_layout(
+    path: &std::path::Path,
+) -> Option<anlg_audio_utils::split_layout::SplitLayout> {
+    let is_session_audio = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "audio.wav" | "audio.mp3" | "audio.ogg"));
+    match path.parent() {
+        Some(dir) if is_session_audio => anlg_audio_utils::split_layout::SplitLayout::load(dir)
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "split_layout_load_failed");
+                None
+            }),
+        _ => None,
+    }
+}
+
+/// Small tolerance for comparing split range endpoints against decoded audio duration so a
+/// 1 ms MP3 frame rounding difference does not trigger a redundant full-file transcription.
+const WHOLE_FILE_SLACK_MS: i64 = 500;
+
+fn split_ranges_blocking(path: &std::path::Path, whole: bool) -> (Vec<(i64, i64)>, bool) {
+    let layout = load_session_split_layout(path);
+    if !whole && layout.is_none() {
+        return (Vec::new(), false);
+    }
+    let end_ms = file_duration_ms(&path.to_string_lossy());
+    let mut ranges = layout.map(|l| l.ranges_ms(end_ms)).unwrap_or_default();
+    if whole {
+        ranges.push((0, end_ms));
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (from, to) in ranges {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    merged.retain(|&(from, to)| to > from);
+    let whole_file = merged.len() == 1
+        && merged[0].0 <= WHOLE_FILE_SLACK_MS
+        && merged[0].1 >= end_ms.saturating_sub(WHOLE_FILE_SLACK_MS);
+    (merged, whole_file)
+}
+
+fn will_split_sides(
+    adapter_kind: AdapterKind,
+    listen_params: &owhisper_interface::ListenParams,
+    ranges: &[(i64, i64)],
+) -> bool {
+    !ranges.is_empty()
+        && listen_params.channels >= 2
+        && split_sides::is_mixed_channel_adapter(adapter_kind)
+}
+
+/// Runs the direct batch for `adapter_kind`. A provider that returns every word on one mixed
+/// channel would lose which person spoke on a split stereo mic, so each side goes alone.
+async fn run_direct(
+    adapter_kind: AdapterKind,
+    params: BatchParams,
+    listen_params: owhisper_interface::ListenParams,
+    ranges: &[(i64, i64)],
+    whole_file: bool,
+) -> crate::Result<BatchRunOutput> {
+    if !will_split_sides(adapter_kind, &listen_params, ranges) {
+        return run_direct_batch_for_adapter_kind(adapter_kind, params, listen_params).await;
+    }
+    split_sides::transcribe_sides(params, ranges, whole_file, |side_params, channels| {
+        let listen_params = owhisper_interface::ListenParams {
+            channels,
+            ..listen_params.clone()
+        };
+        run_direct_batch_for_adapter_kind(adapter_kind, side_params, listen_params)
+    })
+    .await
+}
+
+/// The progressive path cannot transcribe each side alone, so a split recording on a
+/// mixed-channel provider takes the direct path, which does.
+fn use_progressive_path(
+    adapter_kind: AdapterKind,
+    listen_params: &owhisper_interface::ListenParams,
+    ranges: &[(i64, i64)],
+) -> bool {
+    supports_progressive_batch(adapter_kind, listen_params.model.as_deref())
+        && !will_split_sides(adapter_kind, listen_params, ranges)
+}
+
+/// `i64::MAX` when the duration is unknown, so open ranges run to the end of the file.
+fn file_duration_ms(file_path: &str) -> i64 {
+    upload::audio_duration(file_path).map_or(i64::MAX, |duration| duration.as_millis() as i64)
+}
+
+/// Loading the energy and filtering the words share one blocking task, so neither stalls
+/// the async runtime on a long recording.
+async fn drop_bleed(
+    file_path: &str,
+    response: &mut owhisper_interface::batch::Response,
+    ranges: &[(i64, i64)],
+) {
+    let path = file_path.to_string();
+    let ranges = ranges.to_vec();
+    // A copy goes into the task, so a panic there cannot lose the transcript.
+    let owned = response.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut owned = owned;
+        let result = match bleed::stereo_energy(&path, &ranges) {
+            Ok(Some(mut energy)) => {
+                bleed::drop_cross_channel_bleed(&mut owned, &mut energy, &ranges);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        (owned, result)
+    })
+    .await;
+    match joined {
+        Ok((owned, result)) => {
+            *response = owned;
+            if let Err(error) = result {
+                tracing::warn!(error, "batch_bleed_filter_failed");
+            }
+        }
+        Err(error) => tracing::warn!(error = %error, "batch_bleed_filter_failed"),
+    }
 }
 
 fn resolve_batch_adapter_kind(
@@ -417,6 +585,7 @@ mod tests {
             min_speakers: None,
             max_speakers: None,
             known_speakers: vec![],
+            split_stereo_mic: false,
         }
     }
 
@@ -498,6 +667,93 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn split_sessions_on_mixed_channel_providers_skip_the_progressive_path() {
+        let stereo = owhisper_interface::ListenParams {
+            channels: 2,
+            ..listen_params(Some("gpt-4o-transcribe"))
+        };
+        let split = [(0, 10_000)];
+
+        // OpenAI mixes channels and is progressive: a split session goes to the direct
+        // path, where `run_direct` transcribes each side.
+        assert!(!use_progressive_path(AdapterKind::OpenAI, &stereo, &split));
+        assert!(split_sides::is_mixed_channel_adapter(AdapterKind::OpenAI));
+        // A normal session on the same provider stays progressive.
+        assert!(use_progressive_path(AdapterKind::OpenAI, &stereo, &[]));
+        // A provider that keeps channels apart stays progressive.
+        assert!(use_progressive_path(AdapterKind::Argmax, &stereo, &split));
+        // Mono input cannot be split into sides.
+        let mono = owhisper_interface::ListenParams {
+            channels: 1,
+            ..stereo.clone()
+        };
+        assert!(use_progressive_path(AdapterKind::OpenAI, &mono, &split));
+        // A provider that is not progressive stays direct either way.
+        assert!(!use_progressive_path(AdapterKind::Soniox, &stereo, &split));
+    }
+
+    fn write_mono_wav(path: &std::path::Path, seconds: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..16_000 * seconds {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn normal_recordings_have_no_split_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("audio.wav");
+        write_mono_wav(&audio, 2);
+        assert_eq!(split_ranges_blocking(&audio, false), (Vec::new(), false));
+    }
+
+    #[test]
+    fn session_audio_reads_the_split_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("audio.wav");
+        write_mono_wav(&audio, 10);
+        anlg_audio_utils::split_layout::SplitLayout::begin_range(dir.path(), 1_000).unwrap();
+        anlg_audio_utils::split_layout::SplitLayout::end_range(dir.path(), 3_000).unwrap();
+        anlg_audio_utils::split_layout::SplitLayout::begin_range(dir.path(), 6_000).unwrap();
+        assert_eq!(
+            split_ranges_blocking(&audio, false),
+            (vec![(1_000, 3_000), (6_000, 10_000)], false)
+        );
+        // Another file in the same folder is not the session audio.
+        let chunk = dir.path().join("chunk.wav");
+        write_mono_wav(&chunk, 2);
+        assert_eq!(split_ranges_blocking(&chunk, false), (Vec::new(), false));
+        // A whole-file flag covers everything.
+        assert_eq!(
+            split_ranges_blocking(&audio, true),
+            (vec![(0, 10_000)], true)
+        );
+    }
+
+    #[test]
+    fn split_openai_batches_do_not_expect_progressive_timeout() {
+        let mut params = batch_params(BatchProvider::OpenAI, "http://localhost:9000/v1");
+        assert!(expects_progressive_batch(&params));
+        params.split_stereo_mic = true;
+        assert!(!expects_progressive_batch(&params));
+
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("audio.wav");
+        write_mono_wav(&audio, 2);
+        anlg_audio_utils::split_layout::SplitLayout::begin_range(dir.path(), 0).unwrap();
+        params.split_stereo_mic = false;
+        params.file_path = audio.to_string_lossy().into_owned();
+        assert!(!expects_progressive_batch(&params));
     }
 
     #[test]
