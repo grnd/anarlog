@@ -583,6 +583,27 @@ impl AudioProvider for MeetingAudioRouter {
         }
     }
 
+    fn open_split_mic_capture(
+        &self,
+        device: Option<String>,
+        sample_rate: u32,
+        chunk_size: usize,
+    ) -> Result<CaptureStream, Error> {
+        let active = self
+            .runtime
+            .active()
+            .ok_or_else(|| Error::MeetingCaptureFailed("the recording has already ended".into()))?;
+        match self.route_for(&active.identity, device.as_deref(), true) {
+            (CaptureEngine::NativeMeeting, _) => Err(Error::MeetingCaptureUnavailable(
+                "the native engine records both tracks".into(),
+            )),
+            (CaptureEngine::Legacy, _) => self.open_legacy(&active.identity, sample_rate, || {
+                self.inner
+                    .open_split_mic_capture(device, sample_rate, chunk_size)
+            }),
+        }
+    }
+
     fn default_device_name(&self) -> String {
         self.inner.default_device_name()
     }
@@ -601,6 +622,10 @@ impl AudioProvider for MeetingAudioRouter {
 
     fn probe_mic(&self, device: Option<String>) -> Result<(), Error> {
         self.inner.probe_mic(device)
+    }
+
+    fn probe_mic_stereo(&self, device: Option<String>) -> Result<(), Error> {
+        self.inner.probe_mic_stereo(device)
     }
 
     fn probe_speaker(&self) -> Result<(), Error> {

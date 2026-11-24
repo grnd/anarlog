@@ -898,6 +898,12 @@ pub fn delete_capture_audio(session_dir: &Path) -> std::io::Result<()> {
             std::fs::remove_file(entry.path())?;
         }
     }
+    // The layout describes the deleted audio, so it goes with it.
+    match std::fs::remove_file(session_dir.join(anlg_audio_utils::split_layout::SPLIT_LAYOUT_FILE))
+    {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
     match std::fs::remove_file(session_dir.join(DELETE_ON_STOP)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         result => result,

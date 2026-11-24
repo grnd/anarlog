@@ -1,5 +1,6 @@
 mod chunks;
 mod disk;
+mod split_layout;
 pub(crate) use chunks::recover_interrupted_captures_except;
 pub use chunks::{
     RecoveryAudioChunk, acknowledge_recovery_chunk, delete_capture_audio,
@@ -33,6 +34,9 @@ pub struct RecArgs {
     pub capture_started_at: u64,
     pub offset_ms: u64,
     pub session_id: String,
+    /// The capture records a split stereo mic; its stretch of the audio file is noted in the
+    /// session's split layout.
+    pub split_stereo_mic: bool,
 }
 
 pub struct RecState {
@@ -126,7 +130,8 @@ impl Actor for RecorderActor {
             })
         };
         let persist_config = chunks::PersistConfig::new(health_notifier);
-        let (sink, writer_permit, writer_path) = tokio::task::spawn_blocking(move || {
+        let split_stereo_mic = args.split_stereo_mic && args.retain_audio;
+        let (sink, split, writer_permit, writer_path) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&session_dir)?;
             let sink = chunks::ChunkedSink::new(
                 &session_dir,
@@ -135,7 +140,16 @@ impl Actor for RecorderActor {
                 args.retain_audio,
                 persist_config,
             )?;
-            Ok::<_, ActorProcessingErr>((sink, writer_permit, writer_path))
+            // The sink has already merged any older audio, so the range starts after it.
+            let split = if split_stereo_mic {
+                Some(split_layout::SplitRecording::begin(&session_dir))
+            } else {
+                if args.retain_audio {
+                    split_layout::SplitRecording::close_open(&session_dir);
+                }
+                None
+            };
+            Ok::<_, ActorProcessingErr>((sink, split, writer_permit, writer_path))
         })
         .await
         .map_err(into_actor_err)??;
@@ -154,7 +168,7 @@ impl Actor for RecorderActor {
         let writer_task = tokio::task::spawn_blocking(move || {
             let _writer_permit = writer_permit;
             let _writer_path = writer_path;
-            run_writer(sink, writer_rx, myself, error_notifier)
+            run_writer(sink, split, writer_rx, myself, error_notifier)
         });
 
         Ok(RecState {
@@ -253,19 +267,24 @@ async fn await_writer_shutdown(
 
 fn run_writer(
     mut sink: chunks::ChunkedSink,
+    mut split: Option<split_layout::SplitRecording>,
     mut writer_rx: tokio::sync::mpsc::Receiver<WriteRequest>,
     actor: ActorRef<RecMsg>,
     error_notifier: Arc<dyn Fn(String) + Send + Sync>,
 ) -> Result<(), String> {
     while let Some(request) = writer_rx.blocking_recv() {
-        let result = match &request {
-            WriteRequest::AudioSingle(samples) => sink.write(samples, samples),
-            WriteRequest::AudioDual(mic, spk) => sink.write(mic, spk),
-        }
-        .map_err(|error| error.to_string());
+        let (result, frames) = match &request {
+            WriteRequest::AudioSingle(samples) => (sink.write(samples, samples), samples.len()),
+            WriteRequest::AudioDual(mic, spk) => (sink.write(mic, spk), mic.len().max(spk.len())),
+        };
+        let result = result.map_err(|error| error.to_string());
 
         match result {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(split) = split.as_mut() {
+                    split.wrote(frames);
+                }
+            }
             Err(error) => {
                 let _ = actor.cast(RecMsg::WriterFailed(error.clone()));
                 let _ = sink.finish();
@@ -275,7 +294,12 @@ fn run_writer(
     }
 
     match sink.finish() {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Some(split) = split {
+                split.end();
+            }
+            Ok(())
+        }
         Err(error) => {
             error_notifier(format!("audio_storage_unavailable: {error}"));
             Err(error.to_string())

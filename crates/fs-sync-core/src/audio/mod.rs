@@ -16,7 +16,10 @@ pub use activity::has_speech;
 pub use peaks::{AudioPeaks, PEAKS_PER_CHANNEL, cached_peaks, compute_peaks};
 
 const AUDIO_FORMATS: [&str; 3] = ["audio.mp3", "audio.wav", "audio.ogg"];
-const AUDIO_ARTIFACTS: [&str; 7] = [
+// "split-layout.json" is audio_utils::split_layout::SPLIT_LAYOUT_FILE. It describes the audio
+// file, so it must go away with it.
+const SPLIT_LAYOUT_FILE: &str = "split-layout.json";
+const AUDIO_ARTIFACTS: [&str; 8] = [
     "audio.mp3",
     "audio.wav",
     "audio.ogg",
@@ -24,6 +27,7 @@ const AUDIO_ARTIFACTS: [&str; 7] = [
     "audio.wav.tmp",
     "audio_mic.wav",
     "audio_spk.wav",
+    SPLIT_LAYOUT_FILE,
 ];
 
 #[derive(Clone, serde::Serialize, specta::Type)]
@@ -331,6 +335,17 @@ pub fn import_to_session(
     match result {
         Ok(()) => {
             let final_path = target_path;
+            // The old split ranges do not describe the imported audio.
+            match std::fs::remove_file(session_dir.join(SPLIT_LAYOUT_FILE)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    runtime.emit(AudioImportEvent::Failed {
+                        session_id: session_id.to_string(),
+                        error: error.to_string(),
+                    });
+                    return Err(error.into());
+                }
+                _ => {}
+            }
             runtime.emit(AudioImportEvent::Completed {
                 session_id: session_id.to_string(),
             });
@@ -447,6 +462,36 @@ mod tests {
             assert!(!session_dir.join(artifact).exists());
         }
         assert!(note_path.exists());
+    }
+
+    #[test]
+    fn delete_removes_split_layout() {
+        let temp = TempDir::new().unwrap();
+        write_audio(&temp.path().join("audio.wav"));
+        std::fs::write(temp.path().join(SPLIT_LAYOUT_FILE), b"{}").unwrap();
+
+        assert!(delete(temp.path()).unwrap());
+        assert!(!temp.path().join(SPLIT_LAYOUT_FILE).exists());
+    }
+
+    struct NoopRuntime;
+    impl AudioImportRuntime for NoopRuntime {
+        fn emit(&self, _event: AudioImportEvent) {}
+    }
+
+    #[test]
+    fn import_removes_stale_split_layout() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join(SPLIT_LAYOUT_FILE), b"{}").unwrap();
+
+        import_to_session(
+            &NoopRuntime,
+            KNOWN_SESSION_ID,
+            temp.path(),
+            Path::new(anlg_data::english_1::AUDIO_PATH),
+        )
+        .unwrap();
+        assert!(!temp.path().join(SPLIT_LAYOUT_FILE).exists());
     }
 
     #[test]

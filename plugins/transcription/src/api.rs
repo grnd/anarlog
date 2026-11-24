@@ -25,6 +25,8 @@ pub struct CaptureSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mic_muted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_stereo_mic: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<listener::DegradedError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_health: Option<listener::actors::CaptureHealth>,
@@ -103,6 +105,8 @@ pub struct CaptureParams {
     pub keywords: Vec<String>,
     #[serde(default)]
     pub mic_device: Option<String>,
+    #[serde(default)]
+    pub split_stereo_mic: bool,
     #[serde(default)]
     pub transcription_mode: Option<listener::TranscriptionMode>,
     #[serde(default)]
@@ -235,6 +239,8 @@ pub struct TranscriptionParams {
     pub max_speakers: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_context: Option<String>,
+    #[serde(default)]
+    pub split_stereo_mic: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
@@ -306,6 +312,7 @@ impl From<CaptureParams> for listener::actors::SessionParams {
             api_key: value.api_key,
             keywords: value.keywords,
             mic_device: value.mic_device,
+            split_stereo_mic: value.split_stereo_mic,
             participant_human_ids: value.participant_human_ids,
             self_human_id: value.self_human_id,
             // The desktop config sync pushes the transcript's persisted hints
@@ -349,6 +356,7 @@ impl From<listener::Snapshot> for CaptureSnapshot {
             live_segments: None,
             started_at_ms: None,
             mic_muted: None,
+            split_stereo_mic: None,
             degraded: None,
             capture_health: None,
         }
@@ -445,6 +453,7 @@ impl From<TranscriptionParams> for listener2::BatchParams {
             min_speakers: value.min_speakers,
             max_speakers: value.max_speakers,
             known_speakers: vec![],
+            split_stereo_mic: value.split_stereo_mic,
         }
     }
 }
@@ -493,8 +502,11 @@ impl From<listener2::BatchEvent> for TranscriptionEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::CaptureParams;
-    use anlg_transcription_core::listener::{TranscriptionMode, actors::SessionParams};
+    use super::{CaptureParams, TranscriptionParams};
+    use anlg_transcription_core::{
+        listener::{TranscriptionMode, actors::SessionParams},
+        listener2,
+    };
 
     fn capture_params(transcription_mode: Option<TranscriptionMode>) -> CaptureParams {
         CaptureParams {
@@ -508,6 +520,7 @@ mod tests {
             api_key: "test-key".to_string(),
             keywords: vec![],
             mic_device: Some("External Microphone".to_string()),
+            split_stereo_mic: true,
             transcription_mode,
             participant_human_ids: vec![],
             self_human_id: None,
@@ -525,6 +538,33 @@ mod tests {
 
             assert_eq!(session.transcription_mode, expected);
             assert_eq!(session.mic_device.as_deref(), Some("External Microphone"));
+            assert!(session.split_stereo_mic);
         }
+    }
+
+    #[test]
+    fn batch_params_carry_split_stereo_mic() {
+        for flag in [true, false] {
+            let params: TranscriptionParams = serde_json::from_value(serde_json::json!({
+                "session_id": "s",
+                "provider": "hyprnote",
+                "file_path": "/tmp/a.wav",
+                "base_url": "",
+                "api_key": "",
+                "split_stereo_mic": flag,
+            }))
+            .unwrap();
+            assert_eq!(listener2::BatchParams::from(params).split_stereo_mic, flag);
+        }
+
+        let absent: TranscriptionParams = serde_json::from_value(serde_json::json!({
+            "session_id": "s",
+            "provider": "hyprnote",
+            "file_path": "/tmp/a.wav",
+            "base_url": "",
+            "api_key": "",
+        }))
+        .unwrap();
+        assert!(!listener2::BatchParams::from(absent).split_stereo_mic);
     }
 }

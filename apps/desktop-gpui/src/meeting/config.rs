@@ -302,6 +302,7 @@ impl ProviderServices {
             participant_human_ids: participants,
             self_human_id: connection.self_human_id,
             speaker_assignments: Vec::new(),
+            split_stereo_mic: false,
         };
         params.transcription_mode = params.effective_transcription_mode();
         Ok(CaptureConfig {
@@ -346,6 +347,7 @@ impl ProviderServices {
             min_speakers: None,
             max_speakers: None,
             known_speakers: Vec::new(),
+            split_stereo_mic: false,
         })
     }
 

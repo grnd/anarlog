@@ -512,6 +512,8 @@ impl MeetingCaptureEngine for FakeEngine {
 struct FakeAudio {
     engine: Arc<FakeEngine>,
     legacy_opens: AtomicUsize,
+    split_opens: AtomicUsize,
+    stereo: StdMutex<Option<Error>>,
 }
 
 impl AudioProvider for FakeAudio {
@@ -531,6 +533,21 @@ impl AudioProvider for FakeAudio {
     ) -> Result<CaptureStream, Error> {
         self.legacy_opens.fetch_add(1, Ordering::SeqCst);
         Ok(CaptureStream::with_events(stream::empty()))
+    }
+    fn open_split_mic_capture(
+        &self,
+        _: Option<String>,
+        _: u32,
+        _: usize,
+    ) -> Result<CaptureStream, Error> {
+        self.split_opens.fetch_add(1, Ordering::SeqCst);
+        Ok(CaptureStream::with_events(stream::empty()))
+    }
+    fn probe_mic_stereo(&self, _: Option<String>) -> Result<(), Error> {
+        match self.stereo.lock().unwrap().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     fn default_device_name(&self) -> String {
         "Built-in".into()
@@ -560,6 +577,8 @@ fn router(engine: FakeEngine) -> (tempfile::TempDir, Arc<FakeAudio>, Arc<Meeting
     let audio = Arc::new(FakeAudio {
         engine: Arc::new(engine),
         legacy_opens: AtomicUsize::new(0),
+        split_opens: AtomicUsize::new(0),
+        stereo: StdMutex::new(None),
     });
     let router = MeetingAudioRouter::new(audio.clone(), runtime);
     (dir, audio, router)
@@ -882,4 +901,40 @@ async fn a_reopened_helper_reports_on_the_captures_timeline_not_its_own() {
         "{:?}",
         observations[1].at
     );
+}
+
+#[tokio::test]
+async fn the_stereo_probe_reaches_the_inner_provider() {
+    let (_dir, audio, router) = router(FakeEngine::default());
+    assert!(router.probe_mic_stereo(None).is_ok());
+    *audio.stereo.lock().unwrap() = Some(Error::MicNotStereo);
+    assert!(matches!(
+        router.probe_mic_stereo(None),
+        Err(Error::MicNotStereo)
+    ));
+}
+
+#[tokio::test]
+async fn a_split_mic_capture_opens_the_inner_split_stream_on_the_legacy_engine() {
+    let (_dir, audio, router) = router(FakeEngine::default());
+    let runtime = router.runtime().clone();
+    runtime.set_account(Some("acct".into()));
+    let capture = runtime.begin("acct", "s", LifecycleOwner::App).unwrap();
+
+    router.open_split_mic_capture(None, 16_000, 320).unwrap();
+
+    assert_eq!(audio.split_opens.load(Ordering::SeqCst), 1);
+    assert_eq!(audio.legacy_opens.load(Ordering::SeqCst), 0);
+    assert!(audio.engine.requests.lock().unwrap().is_empty());
+    assert_eq!(router.engine_of(&capture), Some(CaptureEngine::Legacy));
+}
+
+#[tokio::test]
+async fn a_split_mic_capture_is_refused_without_an_active_recording() {
+    let (_dir, audio, router) = router(FakeEngine::default());
+    assert!(matches!(
+        router.open_split_mic_capture(None, 16_000, 320),
+        Err(Error::MeetingCaptureFailed(_))
+    ));
+    assert_eq!(audio.split_opens.load(Ordering::SeqCst), 0);
 }

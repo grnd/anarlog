@@ -74,7 +74,23 @@ pub struct LiveTranscriptEngine {
     /// during a closed era keep it even after headphones disconnect. An open
     /// era runs to `i64::MAX`.
     isolated_ranges: Vec<(i64, i64)>,
+    /// Per-channel energy of a split stereo mic, used to drop words that are
+    /// only the other lavalier's bleed. `None` leaves words untouched.
+    bleed: Option<anlg_audio_utils::SplitEnergy>,
+    /// Recent final words that survived the bleed filter. A quiet word only counts as bleed
+    /// when the other channel said the same word at the same time.
+    recent_words: std::collections::VecDeque<RecentWord>,
 }
+
+struct RecentWord {
+    channel: i32,
+    text: String,
+    start_ms: i64,
+    end_ms: i64,
+}
+
+/// How far back the other channel's words stay available for bleed matching.
+const RECENT_WORDS_WINDOW_MS: i64 = 30_000;
 
 impl LiveTranscriptEngine {
     pub fn new(
@@ -133,6 +149,104 @@ impl LiveTranscriptEngine {
             ),
             mic_isolated,
             isolated_ranges,
+            bleed: None,
+            recent_words: Default::default(),
+        }
+    }
+
+    /// Idempotent: the engine outlives listener instances, so the recorded
+    /// energy must survive a reconnect.
+    pub fn enable_bleed_filter(&mut self) {
+        if self.bleed.is_none() {
+            self.bleed = Some(anlg_audio_utils::SplitEnergy::new(
+                crate::actors::SAMPLE_RATE,
+            ));
+        }
+    }
+
+    pub fn observe_split_audio(&mut self, start_ms: i64, left_i16_le: &[u8], right_i16_le: &[u8]) {
+        if let Some(bleed) = self.bleed.as_mut() {
+            bleed.write_i16_le(start_ms, left_i16_le, right_i16_le);
+        }
+    }
+
+    /// A replacing listener resends audio from `ms` on; forget what the previous
+    /// listener recorded there so the replay does not pile onto different audio.
+    pub fn reset_split_audio_from(&mut self, ms: i64) {
+        if let Some(bleed) = self.bleed.as_mut() {
+            bleed.clear_from(ms);
+        }
+        self.recent_words.retain(|w| w.start_ms < ms);
+    }
+
+    /// Drops words and partials that are the other lavalier's bleed: quieter than the leak the
+    /// other channel predicts and a copy of a word that channel said at the same time.
+    ///
+    /// Zero-latency trade-off: if the quiet channel finalizes a bleed word before the loud
+    /// channel emits even a partial for it, the word is kept in live output (batch/re-transcription
+    /// still cleans it up).
+    fn drop_bleed_words(&mut self, delta: &mut LiveTranscriptDelta) {
+        let Some(bleed) = self.bleed.as_mut() else {
+            return;
+        };
+        let others: Vec<(i32, &str, i64, i64)> = self
+            .recent_words
+            .iter()
+            .map(|w| (w.channel, w.text.as_str(), w.start_ms, w.end_ms))
+            .chain(
+                delta
+                    .new_words
+                    .iter()
+                    .map(|w| (w.channel, w.text.as_str(), w.start_ms, w.end_ms)),
+            )
+            .chain(
+                delta
+                    .partials
+                    .iter()
+                    .map(|w| (w.channel, w.text.as_str(), w.start_ms, w.end_ms)),
+            )
+            .collect();
+        let mut is_bleed_word = |channel: i32, text: &str, start_ms: i64, end_ms: i64| {
+            let Ok(ch) = usize::try_from(channel) else {
+                return false;
+            };
+            bleed.is_bleed(ch, start_ms, end_ms)
+                && anlg_audio_utils::has_matching_word(
+                    text,
+                    start_ms,
+                    end_ms,
+                    others
+                        .iter()
+                        .filter(|o| o.0 != channel)
+                        .map(|o| (o.1, o.2, o.3)),
+                )
+        };
+        let keep_words: Vec<bool> = delta
+            .new_words
+            .iter()
+            .map(|w| !is_bleed_word(w.channel, &w.text, w.start_ms, w.end_ms))
+            .collect();
+        let keep_partials: Vec<bool> = delta
+            .partials
+            .iter()
+            .map(|w| !is_bleed_word(w.channel, &w.text, w.start_ms, w.end_ms))
+            .collect();
+        let mut keep = keep_words.into_iter();
+        delta.new_words.retain(|_| keep.next().unwrap_or(true));
+        let mut keep = keep_partials.into_iter();
+        delta.partials.retain(|_| keep.next().unwrap_or(true));
+
+        for w in &delta.new_words {
+            self.recent_words.push_back(RecentWord {
+                channel: w.channel,
+                text: w.text.clone(),
+                start_ms: w.start_ms,
+                end_ms: w.end_ms,
+            });
+        }
+        if let Some(newest) = self.recent_words.iter().map(|w| w.end_ms).max() {
+            self.recent_words
+                .retain(|w| w.end_ms >= newest - RECENT_WORDS_WINDOW_MS);
         }
     }
 
@@ -162,8 +276,12 @@ impl LiveTranscriptEngine {
             }
             _ => self.processor.process(&normalized)?,
         };
-        let transcript_delta: LiveTranscriptDelta = delta.into();
+        let mut transcript_delta: LiveTranscriptDelta = delta.into();
+        self.drop_bleed_words(&mut transcript_delta);
         let segment_delta = self.rendered_segments.apply_delta(&transcript_delta);
+        if transcript_delta.is_empty() && segment_delta.is_none() {
+            return None;
+        }
         Some(LiveTranscriptUpdate {
             transcript_delta,
             segment_delta,
@@ -217,8 +335,9 @@ impl LiveTranscriptEngine {
 
     fn update_from(
         &mut self,
-        transcript_delta: LiveTranscriptDelta,
+        mut transcript_delta: LiveTranscriptDelta,
     ) -> Option<LiveTranscriptUpdate> {
+        self.drop_bleed_words(&mut transcript_delta);
         let segment_delta = self.rendered_segments.apply_delta(&transcript_delta);
         if transcript_delta.is_empty() && segment_delta.is_none() {
             return None;

@@ -77,23 +77,31 @@ pub(super) async fn spawn_source(
     recorder_cell: Option<ActorCell>,
     listener_routing: crate::actors::source::ListenerRouting,
 ) -> Result<ActorRef<SourceMsg>, ractor::SpawnErr> {
-    let recorder = recorder_cell.map(Into::into);
     let (source_ref, _) = Actor::spawn_linked(
         Some(SourceActor::name(&ctx.params.session_id)),
         SourceActor,
-        SourceArgs {
-            mic_device: ctx.params.mic_device.clone(),
-            onboarding: ctx.params.onboarding,
-            runtime: ctx.runtime.clone(),
-            audio: ctx.audio.clone(),
-            session_id: ctx.params.session_id.clone(),
-            listener_routing,
-            recorder,
-        },
+        source_args(ctx, recorder_cell, listener_routing),
         supervisor_cell,
     )
     .await?;
     Ok(source_ref)
+}
+
+fn source_args(
+    ctx: &SessionContext,
+    recorder_cell: Option<ActorCell>,
+    listener_routing: crate::actors::source::ListenerRouting,
+) -> SourceArgs {
+    SourceArgs {
+        mic_device: ctx.params.mic_device.clone(),
+        split_stereo_mic: ctx.params.split_stereo_mic,
+        onboarding: ctx.params.onboarding,
+        runtime: ctx.runtime.clone(),
+        audio: ctx.audio.clone(),
+        session_id: ctx.params.session_id.clone(),
+        listener_routing,
+        recorder: recorder_cell.map(Into::into),
+    }
 }
 
 pub(super) async fn spawn_recorder(
@@ -114,6 +122,7 @@ pub(super) async fn spawn_recorder(
                 .as_millis() as u64,
             offset_ms: ctx.started_at_instant.elapsed().as_millis() as u64,
             session_id: ctx.params.session_id.clone(),
+            split_stereo_mic: ctx.params.split_stereo_mic,
         },
         supervisor_cell,
     )
@@ -153,6 +162,7 @@ pub(super) async fn spawn_listener(
             speaker_assignments: ctx.params.speaker_assignments.clone(),
             live_transcript: ctx.live_transcript.clone(),
             mic_isolated,
+            split_stereo_mic: ctx.params.split_stereo_mic,
         },
         supervisor_cell,
     )
@@ -173,7 +183,11 @@ pub(super) async fn source_mic_isolated(ctx: &SessionContext) -> bool {
             return isolated;
         }
     }
-    crate::actors::source::mic_isolated(&ctx.params.mic_device, ctx.audio.as_ref())
+    crate::actors::source::mic_isolated(
+        &ctx.params.mic_device,
+        ctx.params.split_stereo_mic,
+        ctx.audio.as_ref(),
+    )
 }
 
 pub(super) async fn try_restart_source(
@@ -335,6 +349,31 @@ async fn stop_child(cell: &ActorCell, reason: &str, child: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actors::session::supervisor::tests::{test_ctx, test_state};
+
+    #[test]
+    fn a_restarted_split_source_reopens_the_stereo_mic_the_first_one_opened() {
+        let mut ctx = test_ctx();
+        ctx.params.split_stereo_mic = true;
+        let mut state = test_state(ctx);
+        assert_eq!(state.ctx.params.mic_device, None);
+
+        state.pin_split_mic("DJI MIC MINI".to_string());
+
+        let args = source_args(
+            &state.ctx,
+            None,
+            crate::actors::source::ListenerRouting::Dropped,
+        );
+        assert_eq!(args.mic_device.as_deref(), Some("DJI MIC MINI"));
+    }
+
+    #[test]
+    fn a_non_split_source_keeps_following_the_system_default_on_restart() {
+        let mut state = test_state(test_ctx());
+        state.pin_split_mic("MacBook Mic".to_string());
+        assert_eq!(state.ctx.params.mic_device, None);
+    }
 
     #[test]
     fn source_restart_backoff_is_capped() {

@@ -100,6 +100,7 @@ fn recording(session_id: &str) -> SessionParams {
         api_key: String::new(),
         keywords: vec![],
         mic_device: None,
+        split_stereo_mic: false,
         participant_human_ids: vec![],
         self_human_id: None,
         speaker_assignments: vec![],

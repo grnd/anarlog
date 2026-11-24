@@ -86,6 +86,7 @@ pub struct SessionStateSnapshot {
     /// (headphone output). One shared-speaker stretch pins it to `Some(false)`.
     pub mic_isolated: Option<bool>,
     pub started_at_ms: Option<i64>,
+    pub split_stereo_mic: bool,
     pub degraded: Option<DegradedError>,
 }
 

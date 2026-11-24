@@ -41,6 +41,16 @@ pub struct SessionState {
     shutting_down: bool,
 }
 
+impl SessionState {
+    /// A split capture that started on the system default must not pin a different stereo mic
+    /// when the source restarts, so the device it opened becomes the requested one.
+    fn pin_split_mic(&mut self, device: String) {
+        if self.ctx.params.split_stereo_mic {
+            self.ctx.params.mic_device = Some(device);
+        }
+    }
+}
+
 pub struct SessionActor;
 
 pub enum SessionMsg {
@@ -49,6 +59,8 @@ pub enum SessionMsg {
     RetryRecorder,
     SourceHealthy,
     SourceRoutingChanged,
+    /// A split capture opened this stereo mic; restarts must reopen the same one.
+    SplitMicOpened(String),
     UpdateCredentials(String),
     UpdateConfig(SessionConfigUpdate),
 }
@@ -152,6 +164,7 @@ impl Actor for SessionActor {
             SessionMsg::SourceRoutingChanged => {
                 refresh_listener_on_isolation_change(&myself, state).await;
             }
+            SessionMsg::SplitMicOpened(device) => state.pin_split_mic(device),
             SessionMsg::Shutdown => {
                 state.shutting_down = true;
                 children::shutdown_children(state, "session_stop").await;
@@ -803,6 +816,7 @@ mod tests {
                 api_key: "test-key".to_string(),
                 keywords: vec![],
                 mic_device: None,
+                split_stereo_mic: false,
                 participant_human_ids: vec![],
                 self_human_id: None,
                 speaker_assignments: vec![],

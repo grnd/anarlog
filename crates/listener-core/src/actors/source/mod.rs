@@ -41,6 +41,7 @@ pub enum SourceMsg {
     ChannelFailed(CaptureChannel, String),
     RetryCapture(Option<String>),
     InputChanged,
+    DeviceListChanged,
     OutputChanged,
     StreamFailed(String),
 }
@@ -73,6 +74,7 @@ pub enum ListenerRouting {
 
 pub struct SourceArgs {
     pub mic_device: Option<String>,
+    pub split_stereo_mic: bool,
     pub onboarding: bool,
     pub runtime: Arc<dyn ListenerRuntime>,
     pub audio: Arc<dyn AudioProvider>,
@@ -87,6 +89,7 @@ pub struct SourceState {
     pub(super) session_id: String,
     /// The user's explicit choice; `None` defers to the system default.
     pub(super) mic_device: Option<String>,
+    pub(super) split_stereo_mic: bool,
     /// The device the current stream actually opened. Differs from `mic_device` when a Bluetooth
     /// default input was swapped for a wired one.
     pub(super) active_mic_device: Option<String>,
@@ -149,7 +152,11 @@ impl DeviceChangeWatcher {
                     .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
             };
             match event {
-                Ok(DeviceSwitch::DeviceListChanged) => {}
+                Ok(DeviceSwitch::DeviceListChanged) => {
+                    // A split capture parked after its retries ran out reconnects when its
+                    // receiver is plugged back in, even if the default input did not change.
+                    let _ = actor.cast(SourceMsg::DeviceListChanged);
+                }
                 Ok(event)
                     if !device_switch_updates_capture(
                         &event,
@@ -198,10 +205,26 @@ fn headphone_only_output() -> bool {
 
 // The same mic-isolation verdict `start_source_loop` emits as `MicIsolated`, recomputed
 // for callers that need it without a running source (e.g. listener spawn).
-pub(crate) fn mic_isolated(mic_device: &Option<String>, audio: &dyn AudioProvider) -> bool {
+pub(crate) fn mic_isolated(
+    mic_device: &Option<String>,
+    split_stereo_mic: bool,
+    audio: &dyn AudioProvider,
+) -> bool {
+    if split_stereo_mic {
+        return true;
+    }
     let mic_swapped =
         mic_device.is_none() && stream::active_mic_device(mic_device.clone(), audio).is_some();
     headphone_only_output() && !mic_swapped
+}
+
+// Checks the device the split capture will open, so a mono input rejects the start instead of
+// failing inside a running session.
+pub(crate) fn probe_split_mic(
+    mic_device: Option<String>,
+    audio: &dyn AudioProvider,
+) -> Result<(), anlg_audio::Error> {
+    audio.probe_mic_stereo(stream::active_mic_device(mic_device, audio))
 }
 
 // Holding a Bluetooth headset in HFP/SCO sets the system default input and can also move
@@ -309,13 +332,15 @@ impl Actor for SourceActor {
             let mic_device = args.mic_device;
             tracing::info!(mic_device = ?mic_device);
 
-            let pipeline = Pipeline::new(args.runtime.clone(), args.session_id.clone());
+            let mut pipeline = Pipeline::new(args.runtime.clone(), args.session_id.clone());
+            pipeline.set_split_stereo_mic(args.split_stereo_mic);
 
             let mut st = SourceState {
                 runtime: args.runtime,
                 audio: args.audio,
                 session_id: args.session_id,
                 mic_device,
+                split_stereo_mic: args.split_stereo_mic,
                 active_mic_device: None,
                 onboarding: args.onboarding,
                 capture_mic_isolated: false,
@@ -396,12 +421,14 @@ impl Actor for SourceActor {
                 SourceMsg::OutputChanged => {
                     if st.current_mode == ChannelMode::SpeakerOnly {
                         myself.stop(Some("device_change".into()));
-                    } else if st.current_mode == ChannelMode::MicAndSpeaker {
+                    } else if st.current_mode == ChannelMode::MicAndSpeaker && !st.split_stereo_mic
+                    {
                         let swapped = st.mic_device.as_ref().map_or(
                             stream::active_mic_device(None, st.audio.as_ref()).is_some(),
                             |requested| st.active_mic_device.as_ref() != Some(requested),
                         );
-                        let capture = stream::capture_settings(swapped);
+                        let capture = stream::capture_settings(swapped)
+                            .with_split_stereo_mic(st.split_stereo_mic);
                         st.capture_mic_isolated = capture.mic_isolated;
                         if let Some(output) = &st.capture_output {
                             let _ = output.send(capture.enable_aec);
@@ -409,11 +436,33 @@ impl Actor for SourceActor {
                         emit_mic_isolation(st);
                     }
                 }
+                SourceMsg::InputChanged if st.split_stereo_mic => {
+                    // A split capture stays on the stereo mic it opened or was told to use, so
+                    // a new default input only retries that mic: a healthy capture ignores it,
+                    // and a mic that came back after automatic retries ran out reconnects.
+                    // This holds for a mic picked by name as well.
+                    if let Some(retry) = &st.capture_retry {
+                        let _ = retry.send((st.mic_device.clone(), false));
+                    }
+                }
+                SourceMsg::DeviceListChanged if st.split_stereo_mic => {
+                    // Only a mic that already failed reconnects here. A retry while the first
+                    // open is still waiting for audio would restart that open, and a burst of
+                    // device list events while a receiver is plugged in would restart it again
+                    // and again.
+                    if st.capture_health.mic == Some(false)
+                        && let Some(retry) = &st.capture_retry
+                    {
+                        let _ = retry.send((st.mic_device.clone(), false));
+                    }
+                }
+                SourceMsg::DeviceListChanged => {}
                 SourceMsg::InputChanged => {
                     if st.mic_device.is_some() {
                         return Ok(());
                     }
-                    st.capture_mic_isolated = mic_isolated(&st.mic_device, st.audio.as_ref());
+                    st.capture_mic_isolated =
+                        mic_isolated(&st.mic_device, st.split_stereo_mic, st.audio.as_ref());
                     if let Some(retry) = &st.capture_retry {
                         let _ = retry.send((
                             stream::active_mic_device(st.mic_device.clone(), st.audio.as_ref()),
@@ -423,10 +472,17 @@ impl Actor for SourceActor {
                 }
                 SourceMsg::RetryCapture(device) => {
                     st.mic_device = device.clone();
-                    st.capture_mic_isolated = mic_isolated(&st.mic_device, st.audio.as_ref());
+                    st.capture_mic_isolated =
+                        mic_isolated(&st.mic_device, st.split_stereo_mic, st.audio.as_ref());
                     if let Some(retry) = &st.capture_retry {
-                        let _ = retry
-                            .send((stream::active_mic_device(device, st.audio.as_ref()), false));
+                        // A split capture keeps its own mic when no device is named; swapping in a
+                        // wired mic for a Bluetooth default would move it to another device.
+                        let device = if st.split_stereo_mic {
+                            device
+                        } else {
+                            stream::active_mic_device(device, st.audio.as_ref())
+                        };
+                        let _ = retry.send((device, false));
                     }
                 }
                 SourceMsg::CaptureReady => {
@@ -449,11 +505,23 @@ impl Actor for SourceActor {
                     }
                     if channel == CaptureChannel::Mic {
                         st.active_mic_device = device;
+                        if st.split_stereo_mic
+                            && let Some(name) = st.active_mic_device.clone()
+                            && let Some(cell) = ractor::registry::where_is(
+                                crate::actors::session_supervisor_name(&st.session_id),
+                            )
+                        {
+                            let supervisor: ActorRef<crate::actors::SessionMsg> = cell.into();
+                            let _ =
+                                supervisor.cast(crate::actors::SessionMsg::SplitMicOpened(name));
+                        }
                         let swapped = st.mic_device.as_ref().map_or(
                             stream::active_mic_device(None, st.audio.as_ref()).is_some(),
                             |requested| st.active_mic_device.as_ref() != Some(requested),
                         );
-                        st.capture_mic_isolated = stream::capture_settings(swapped).mic_isolated;
+                        st.capture_mic_isolated = stream::capture_settings(swapped)
+                            .with_split_stereo_mic(st.split_stereo_mic)
+                            .mic_isolated;
                         emit_mic_isolation(st);
                     }
                     if channel == CaptureChannel::Mic {
@@ -643,8 +711,15 @@ mod tests {
         fn emit_data(&self, _event: SessionDataEvent) {}
     }
 
+    #[derive(Debug, PartialEq)]
+    enum SplitCall {
+        Open(Option<String>),
+        Retry(Option<String>, bool),
+    }
+
     struct TestAudio {
         capture_tx: mpsc::UnboundedSender<Option<String>>,
+        split_capture_tx: Option<mpsc::UnboundedSender<SplitCall>>,
         default_device_name_calls: AtomicUsize,
         end_immediately: bool,
         emit_frame: bool,
@@ -655,6 +730,33 @@ mod tests {
     }
 
     impl AudioProvider for TestAudio {
+        fn open_split_mic_capture(
+            &self,
+            device: Option<String>,
+            _sample_rate: u32,
+            _chunk_size: usize,
+        ) -> Result<CaptureStream, Error> {
+            let calls = self.split_capture_tx.clone().unwrap();
+            let _ = calls.send(SplitCall::Open(device.clone()));
+            Ok(CaptureStream::with_events(
+                stream::iter([
+                    Ok(CaptureEvent::ChannelReady {
+                        channel: CaptureChannel::Mic,
+                        device,
+                    }),
+                    Ok(CaptureEvent::Frame(CaptureFrame {
+                        raw_mic: Arc::from(vec![0.25; 320]),
+                        raw_speaker: Arc::from(vec![-0.25; 320]),
+                        aec_mic: None,
+                    })),
+                ])
+                .chain(stream::pending()),
+            )
+            .with_retry(move |device, force| {
+                let _ = calls.send(SplitCall::Retry(device, force));
+            }))
+        }
+
         fn open_capture(&self, config: CaptureConfig) -> Result<CaptureStream, Error> {
             let _ = self.capture_tx.send(config.mic_device);
             if self.paused_after_ready {
@@ -794,6 +896,7 @@ mod tests {
         let (capture_tx, mut capture_rx) = mpsc::unbounded_channel();
         let audio = Arc::new(TestAudio {
             capture_tx,
+            split_capture_tx: None,
             default_device_name_calls: AtomicUsize::new(0),
             end_immediately: false,
             emit_frame: true,
@@ -808,6 +911,7 @@ mod tests {
             SourceActor,
             SourceArgs {
                 mic_device: expected.clone(),
+                split_stereo_mic: false,
                 onboarding: false,
                 runtime: Arc::new(TestRuntime {
                     progress_tx,
@@ -854,6 +958,7 @@ mod tests {
             SourceActor,
             SourceArgs {
                 mic_device: None,
+                split_stereo_mic: false,
                 onboarding: false,
                 runtime: Arc::new(TestRuntime {
                     progress_tx,
@@ -861,6 +966,7 @@ mod tests {
                 }),
                 audio: Arc::new(TestAudio {
                     capture_tx,
+                    split_capture_tx: None,
                     default_device_name_calls: AtomicUsize::new(0),
                     end_immediately: false,
                     emit_frame: false,
@@ -898,6 +1004,7 @@ mod tests {
             SourceActor,
             SourceArgs {
                 mic_device: None,
+                split_stereo_mic: false,
                 onboarding: false,
                 runtime: Arc::new(TestRuntime {
                     progress_tx,
@@ -905,6 +1012,7 @@ mod tests {
                 }),
                 audio: Arc::new(TestAudio {
                     capture_tx,
+                    split_capture_tx: None,
                     default_device_name_calls: AtomicUsize::new(0),
                     end_immediately: false,
                     emit_frame: false,
@@ -995,6 +1103,7 @@ mod tests {
             SourceActor,
             SourceArgs {
                 mic_device: Some("working mic".into()),
+                split_stereo_mic: false,
                 onboarding: false,
                 runtime: Arc::new(TestRuntime {
                     progress_tx,
@@ -1002,6 +1111,7 @@ mod tests {
                 }),
                 audio: Arc::new(TestAudio {
                     capture_tx,
+                    split_capture_tx: None,
                     default_device_name_calls: AtomicUsize::new(0),
                     end_immediately: false,
                     emit_frame: true,
@@ -1045,6 +1155,261 @@ mod tests {
         assert_source_uses_mic_device(Some("external-mic")).await;
     }
 
+    #[test]
+    fn split_stereo_mic_reports_the_mic_isolated_for_the_listener() {
+        let (capture_tx, _capture_rx) = mpsc::unbounded_channel();
+        let audio = TestAudio {
+            capture_tx,
+            split_capture_tx: None,
+            default_device_name_calls: AtomicUsize::new(0),
+            end_immediately: false,
+            emit_frame: false,
+            partial_audio: false,
+            gap_only: false,
+            paused_after_ready: false,
+            output_tx: None,
+        };
+        assert!(mic_isolated(&None, true, &audio));
+        assert!(mic_isolated(
+            &Some("DJI MIC MINI".to_string()),
+            true,
+            &audio
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_opens_split_mic_capture_and_keeps_it_isolated_through_recovery() {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (capture_tx, mut capture_rx) = mpsc::unbounded_channel();
+        let (split_capture_tx, mut split_capture_rx) = mpsc::unbounded_channel();
+        let audio = Arc::new(TestAudio {
+            capture_tx,
+            split_capture_tx: Some(split_capture_tx),
+            default_device_name_calls: AtomicUsize::new(0),
+            end_immediately: false,
+            emit_frame: false,
+            partial_audio: false,
+            gap_only: false,
+            paused_after_ready: false,
+            output_tx: None,
+        });
+        let (actor, handle) = Actor::spawn(
+            None,
+            SourceActor,
+            SourceArgs {
+                mic_device: Some("DJI MIC MINI".to_string()),
+                split_stereo_mic: true,
+                onboarding: false,
+                runtime: Arc::new(TestRuntime {
+                    progress_tx,
+                    error_tx: None,
+                }),
+                audio,
+                session_id: "test-session".to_string(),
+                listener_routing: ListenerRouting::Dropped,
+                recorder: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let call = tokio::time::timeout(std::time::Duration::from_secs(1), split_capture_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(call, SplitCall::Open(Some("DJI MIC MINI".to_string())));
+        assert!(
+            capture_rx.try_recv().is_err(),
+            "system audio capture must not open"
+        );
+
+        // Readiness comes from the split device's real frames, and an output change neither
+        // turns AEC on nor drops the isolation a split mic always has.
+        let ready_device = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(SessionProgressEvent::AudioReady { device, .. }) =
+                    progress_rx.recv().await
+                {
+                    break device;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ready_device.as_deref(), Some("DJI MIC MINI"));
+        for output_changed in [false, true] {
+            if output_changed {
+                actor.cast(SourceMsg::OutputChanged).unwrap();
+            }
+            let isolated = actor
+                .call(SourceMsg::GetMicIsolated, Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
+            assert!(matches!(isolated, ractor::rpc::CallResult::Success(true)));
+        }
+        let health = actor
+            .call(SourceMsg::GetCaptureHealth, Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            health,
+            ractor::rpc::CallResult::Success(CaptureHealth {
+                mic: Some(true),
+                speaker: None,
+                unavailable: false,
+            })
+        ));
+
+        actor.stop(None);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_changes_and_retries_keep_a_split_capture_on_its_own_mic() {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (capture_tx, _capture_rx) = mpsc::unbounded_channel();
+        let (split_capture_tx, mut split_capture_rx) = mpsc::unbounded_channel();
+        let audio = Arc::new(TestAudio {
+            capture_tx,
+            split_capture_tx: Some(split_capture_tx),
+            default_device_name_calls: AtomicUsize::new(0),
+            end_immediately: false,
+            emit_frame: false,
+            partial_audio: false,
+            gap_only: false,
+            paused_after_ready: false,
+            output_tx: None,
+        });
+        let (actor, handle) = Actor::spawn(
+            None,
+            SourceActor,
+            SourceArgs {
+                mic_device: None,
+                split_stereo_mic: true,
+                onboarding: false,
+                runtime: Arc::new(TestRuntime {
+                    progress_tx,
+                    error_tx: None,
+                }),
+                audio,
+                session_id: "test-session".to_string(),
+                listener_routing: ListenerRouting::Dropped,
+                recorder: None,
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !matches!(
+                progress_rx.recv().await,
+                Some(SessionProgressEvent::AudioReady { .. })
+            ) {}
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            split_capture_rx.recv().await,
+            Some(SplitCall::Open(_))
+        ));
+
+        // The retry names no device, so recovery reopens the pinned mic rather than the new
+        // default, and doesn't force a healthy capture to restart.
+        actor.cast(SourceMsg::InputChanged).unwrap();
+        let call = tokio::time::timeout(Duration::from_secs(1), split_capture_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(call, Some(SplitCall::Retry(None, false)));
+
+        // Retry forwards the selection as is, never a wired mic swapped in for a Bluetooth default.
+        for device in [None, Some("USB Mic".to_string())] {
+            actor.cast(SourceMsg::RetryCapture(device.clone())).unwrap();
+            let call = tokio::time::timeout(Duration::from_secs(1), split_capture_rx.recv())
+                .await
+                .unwrap();
+            assert_eq!(call, Some(SplitCall::Retry(device, false)));
+        }
+
+        actor.stop(None);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_and_device_list_changes_retry_a_split_mic_picked_by_name() {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (capture_tx, _capture_rx) = mpsc::unbounded_channel();
+        let (split_capture_tx, mut split_capture_rx) = mpsc::unbounded_channel();
+        let audio = Arc::new(TestAudio {
+            capture_tx,
+            split_capture_tx: Some(split_capture_tx),
+            default_device_name_calls: AtomicUsize::new(0),
+            end_immediately: false,
+            emit_frame: false,
+            partial_audio: false,
+            gap_only: false,
+            paused_after_ready: false,
+            output_tx: None,
+        });
+        let (actor, handle) = Actor::spawn(
+            None,
+            SourceActor,
+            SourceArgs {
+                mic_device: Some("DJI MIC MINI".to_string()),
+                split_stereo_mic: true,
+                onboarding: false,
+                runtime: Arc::new(TestRuntime {
+                    progress_tx,
+                    error_tx: None,
+                }),
+                audio,
+                session_id: "test-session".to_string(),
+                listener_routing: ListenerRouting::Dropped,
+                recorder: None,
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !matches!(
+                progress_rx.recv().await,
+                Some(SessionProgressEvent::AudioReady { .. })
+            ) {}
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            split_capture_rx.recv().await,
+            Some(SplitCall::Open(_))
+        ));
+
+        let retry = Some(SplitCall::Retry(Some("DJI MIC MINI".to_string()), false));
+        // A device list change while the mic is not failed must not restart it: only the
+        // input change reaches the capture.
+        actor.cast(SourceMsg::DeviceListChanged).unwrap();
+        actor.cast(SourceMsg::InputChanged).unwrap();
+        let call = tokio::time::timeout(Duration::from_secs(1), split_capture_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(call, retry);
+        assert!(split_capture_rx.try_recv().is_err());
+
+        // A receiver replugged after the automatic retries ran out reconnects to the same
+        // device when only the device list changed.
+        actor
+            .cast(SourceMsg::ChannelFailed(
+                CaptureChannel::Mic,
+                "gone".to_string(),
+            ))
+            .unwrap();
+        actor.cast(SourceMsg::DeviceListChanged).unwrap();
+        let call = tokio::time::timeout(Duration::from_secs(1), split_capture_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(call, retry);
+
+        actor.stop(None);
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn capture_stream_eof_reports_a_restartable_failure() {
         let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
@@ -1052,6 +1417,7 @@ mod tests {
         let (capture_tx, _capture_rx) = mpsc::unbounded_channel();
         let audio = Arc::new(TestAudio {
             capture_tx,
+            split_capture_tx: None,
             default_device_name_calls: AtomicUsize::new(0),
             end_immediately: true,
             emit_frame: false,
@@ -1065,6 +1431,7 @@ mod tests {
             SourceActor,
             SourceArgs {
                 mic_device: None,
+                split_stereo_mic: false,
                 onboarding: false,
                 runtime: Arc::new(TestRuntime {
                     progress_tx,
@@ -1119,6 +1486,7 @@ mod tests {
                         capture_started_at: 1,
                         offset_ms: 0,
                         session_id: "partial-audio".into(),
+                        split_stereo_mic: false,
                     },
                 )
                 .await
@@ -1143,10 +1511,12 @@ mod tests {
             SourceActor,
             SourceArgs {
                 mic_device: Some("unavailable mic".into()),
+                split_stereo_mic: false,
                 onboarding: false,
                 runtime,
                 audio: Arc::new(TestAudio {
                     capture_tx,
+                    split_capture_tx: None,
                     default_device_name_calls: AtomicUsize::new(0),
                     end_immediately: false,
                     emit_frame: false,
@@ -1324,6 +1694,7 @@ mod tests {
                     let (capture_tx, _capture_rx) = mpsc::unbounded_channel();
                     let audio = Arc::new(TestAudio {
                         capture_tx,
+                        split_capture_tx: None,
                         default_device_name_calls: AtomicUsize::new(0),
                         end_immediately: false,
                         emit_frame: true,
@@ -1337,6 +1708,7 @@ mod tests {
                         SourceActor,
                         SourceArgs {
                             mic_device: None,
+                            split_stereo_mic: false,
                             onboarding: false,
                             runtime: Arc::new(TestRuntime {
                                 progress_tx,

@@ -234,6 +234,7 @@ pub async fn transcribe(
         min_speakers: None,
         max_speakers: None,
         known_speakers: Vec::new(),
+        split_stereo_mic: false,
     };
     let output = tokio::select! {
         _ = cancellation.cancelled() => return Err(ServiceError::Cancelled),

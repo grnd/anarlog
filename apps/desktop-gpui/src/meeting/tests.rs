@@ -2110,6 +2110,7 @@ async fn native_capture_uses_fixture_audio_and_keeps_unresolved_batch_marker() {
                         participant_human_ids: Vec::new(),
                         self_human_id: None,
                         speaker_assignments: Vec::new(),
+                        split_stereo_mic: false,
                     },
                     provider: "fixture".into(),
                     retention: Retention::Forever,

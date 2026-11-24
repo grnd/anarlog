@@ -42,6 +42,7 @@ struct CachedSessionState {
     live_transcription_active: bool,
     live_segments: Vec<anlg_transcription_core::listener::LiveTranscriptSegment>,
     started_at_ms: Option<i64>,
+    split_stereo_mic: bool,
     degraded: Option<anlg_transcription_core::listener::DegradedError>,
 }
 
@@ -56,6 +57,7 @@ fn hydrate_session_state(
         snapshot.live_transcription_active = Some(cached.live_transcription_active);
         snapshot.live_segments = Some(cached.live_segments);
         snapshot.started_at_ms = cached.started_at_ms;
+        snapshot.split_stereo_mic = Some(cached.split_stereo_mic);
         snapshot.degraded = cached.degraded;
     } else {
         snapshot.live_segments = Some(Vec::new());
@@ -126,6 +128,7 @@ impl<'a, R: tauri::Runtime, M: tauri::Manager<R>> Listener<'a, R, M> {
                         live_transcription_active: state.live_transcription_active,
                         live_segments: state.live_segments.clone(),
                         started_at_ms: state.started_at_ms,
+                        split_stereo_mic: state.split_stereo_mic,
                         degraded: state.degraded.clone(),
                     })
                 });
@@ -220,6 +223,8 @@ impl<'a, R: tauri::Runtime, M: tauri::Manager<R>> Listener<'a, R, M> {
         params: SessionParams,
         capture_id: Option<String>,
     ) -> Result<(), crate::Error> {
+        let session_id = params.session_id.clone();
+        let split_stereo_mic = params.split_stereo_mic;
         if let Some(cell) = registry::where_is(RootActor::name()) {
             let actor: ActorRef<RootMsg> = cell.into();
             let started = match capture_id {
@@ -229,12 +234,22 @@ impl<'a, R: tauri::Runtime, M: tauri::Manager<R>> Listener<'a, R, M> {
                 None => ractor::call!(actor, RootMsg::StartSession, params),
             };
             match started {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(())) => {
+                    if let Some(cache) = self.manager.try_state::<SessionStateCache>()
+                        && let Ok(mut cache) = cache.lock()
+                    {
+                        cache.entry(session_id).or_default().split_stereo_mic = split_stereo_mic;
+                    }
+                    Ok(())
+                }
                 Ok(Err(StartSessionError::SessionAlreadyRunning)) => {
                     Err(crate::Error::SessionAlreadyRunning)
                 }
                 Ok(Err(StartSessionError::FailedToResolveSessionsDir)) => {
                     Err(crate::Error::SessionStorageUnavailable)
+                }
+                Ok(Err(StartSessionError::MicNotStereo)) => {
+                    Err(anlg_audio::Error::MicNotStereo.into())
                 }
                 Ok(Err(_)) => Err(crate::Error::StartSessionFailed),
                 Err(_) => Err(crate::Error::StartSessionFailed),
@@ -496,6 +511,7 @@ mod tests {
             live_segments: None,
             started_at_ms: None,
             mic_muted: None,
+            split_stereo_mic: None,
             degraded: None,
             capture_health: None,
         };

@@ -701,6 +701,7 @@ mod tests {
             speaker_assignments: vec![],
             live_transcript: Default::default(),
             mic_isolated: false,
+            split_stereo_mic: false,
         }
     }
 

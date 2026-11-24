@@ -176,6 +176,7 @@ pub fn provider_transcriber(services: ProviderServices) -> Transcriber {
                     min_speakers: None,
                     max_speakers: None,
                     known_speakers: Vec::new(),
+                    split_stereo_mic: false,
                 };
                 let batch = Arc::new(Batch {
                     cancellation: cancellation.clone(),

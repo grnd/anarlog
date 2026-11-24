@@ -71,4 +71,6 @@ pub enum StartSessionError {
     /// The capture was stopped or ended before its start reached the recorder.
     #[serde(rename = "capture_ended")]
     CaptureEnded,
+    #[serde(rename = "mic_not_stereo")]
+    MicNotStereo,
 }
